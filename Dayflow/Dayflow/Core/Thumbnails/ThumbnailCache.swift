@@ -22,6 +22,10 @@ final class ThumbnailCache {
 
   private init() {}
 
+  func clear() {
+    queue.cancelAllOperations()
+  }
+
   /// Generate thumbnail on demand; completion runs on main thread.
   func fetchThumbnail(
     videoURL: String, targetSize: CGSize, completion: @escaping (NSImage?) -> Void
@@ -29,7 +33,9 @@ final class ThumbnailCache {
     let normalizedURL = normalize(urlString: videoURL)
 
     queue.addOperation { [weak self] in
-      let image = self?.generateThumbnail(urlString: normalizedURL, targetSize: targetSize)
+      let image = autoreleasepool {
+        self?.generateThumbnail(urlString: normalizedURL, targetSize: targetSize)
+      }
       DispatchQueue.main.async {
         completion(image)
       }

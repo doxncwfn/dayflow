@@ -12,7 +12,7 @@ enum ScreenshotConfig {
   static let heightOptions: [Int] = [720, 1080]
 
   static let defaultInterval: TimeInterval = 10
-  static let defaultHeight = 1080
+  static let defaultHeight = 720
 
   /// Seconds between captures.
   static var interval: TimeInterval {
@@ -30,10 +30,10 @@ enum ScreenshotConfig {
   static var captureHeight: Int {
     get {
       let stored = UserDefaults.standard.integer(forKey: captureHeightKey)
-      return heightOptions.contains(stored) ? stored : defaultHeight
+      return heightOptions.contains(stored) ? min(stored, 720) : defaultHeight
     }
     set {
-      UserDefaults.standard.set(newValue, forKey: captureHeightKey)
+      UserDefaults.standard.set(min(newValue, 720), forKey: captureHeightKey)
       postChange()
     }
   }

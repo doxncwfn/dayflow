@@ -105,6 +105,13 @@ struct SettingsOtherTabView: View {
         }
 
         SettingsRow(
+          label: String(localized: "Open main window on launch"),
+          subtitle: String(localized: "When off, Dayflow starts quietly in the menu bar and consumes ~26 MB RAM until opened.")
+        ) {
+          SettingsToggle(isOn: $viewModel.openWindowOnLaunch)
+        }
+
+        SettingsRow(
           label: String(localized: "Show app/website icons in timeline"),
           subtitle: String(localized: "When off, timeline cards won't show app or website icons.")
         ) {

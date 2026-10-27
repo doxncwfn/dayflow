@@ -5,9 +5,89 @@
 
 import AppKit
 import Combine
+import Darwin
 import Foundation
 import GRDB
 import SwiftUI
+
+enum LLMURLSession {
+  static let shared: URLSession = {
+    let config = URLSessionConfiguration.ephemeral
+    config.urlCache = nil
+    config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    config.httpCookieStorage = nil
+    config.httpShouldSetCookies = false
+    return URLSession(configuration: config)
+  }()
+
+  static func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+    var req = request
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    if let body = req.httpBody {
+      req.httpBody = nil
+      return try await uploadData(body, for: req)
+    }
+    return try await shared.data(for: req)
+  }
+
+  static func upload(for request: URLRequest, fromFile fileURL: URL) async throws -> (
+    Data, URLResponse
+  ) {
+    var req = request
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    req.httpBody = nil
+    return try await shared.upload(for: req, fromFile: fileURL)
+  }
+
+  static func uploadData(_ bodyData: Data, for request: URLRequest) async throws -> (
+    Data, URLResponse
+  ) {
+    let tempURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("dayflow_payload_\(UUID().uuidString).tmp")
+    defer {
+      try? FileManager.default.removeItem(at: tempURL)
+      malloc_zone_pressure_relief(nil, 0)
+    }
+    try autoreleasepool {
+      try bodyData.write(to: tempURL, options: .atomic)
+    }
+    return try await upload(for: request, fromFile: tempURL)
+  }
+
+  static func uploadJSON<T: Encodable>(
+    _ payload: T,
+    for request: URLRequest,
+    encoder: JSONEncoder = JSONEncoder()
+  ) async throws -> (Data, URLResponse) {
+    let tempURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("dayflow_json_\(UUID().uuidString).json")
+    defer {
+      try? FileManager.default.removeItem(at: tempURL)
+      malloc_zone_pressure_relief(nil, 0)
+    }
+    try autoreleasepool {
+      let data = try encoder.encode(payload)
+      try data.write(to: tempURL, options: .atomic)
+    }
+    return try await upload(for: request, fromFile: tempURL)
+  }
+
+  static func uploadJSONObject(_ object: Any, for request: URLRequest) async throws -> (
+    Data, URLResponse
+  ) {
+    let tempURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("dayflow_jsonobj_\(UUID().uuidString).json")
+    defer {
+      try? FileManager.default.removeItem(at: tempURL)
+      malloc_zone_pressure_relief(nil, 0)
+    }
+    try autoreleasepool {
+      let data = try JSONSerialization.data(withJSONObject: object)
+      try data.write(to: tempURL, options: .atomic)
+    }
+    return try await upload(for: request, fromFile: tempURL)
+  }
+}
 
 private final class TimelineCardGenerationGate: @unchecked Sendable {
   private let lock = NSLock()

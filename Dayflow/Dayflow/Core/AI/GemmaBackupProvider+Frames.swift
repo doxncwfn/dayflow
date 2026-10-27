@@ -6,8 +6,17 @@ extension GemmaBackupProvider {
 
   struct FrameData {
     let index: Int
-    let base64Image: String
+    let screenshot: Screenshot
     let timestamp: TimeInterval
+  }
+
+  private func encodeFrameBase64(_ frame: FrameData) -> String? {
+    autoreleasepool {
+      guard let imageData = frame.screenshot.jpegData(maxHeight: 720, quality: 0.65) else {
+        return nil
+      }
+      return imageData.base64EncodedString()
+    }
   }
 
   struct FrameDescriptionEnvelope: Codable {
@@ -46,16 +55,21 @@ extension GemmaBackupProvider {
   func describeFramesInSingleBatch(_ frames: [FrameData], batchId: Int64?) async throws
     -> [(timestamp: TimeInterval, description: String)]
   {
-    let prompt = frameDescriptionPrompt(frameCount: frames.count)
-    var parts: [[String: Any]] = [["text": prompt]]
+    var validFrames: [FrameData] = []
+    var parts: [[String: Any]] = []
     for frame in frames {
-      parts.append([
-        "inline_data": [
-          "mime_type": "image/jpeg",
-          "data": frame.base64Image,
-        ]
-      ])
+      if let base64 = encodeFrameBase64(frame) {
+        validFrames.append(frame)
+        parts.append([
+          "inline_data": [
+            "mime_type": "image/jpeg",
+            "data": base64,
+          ]
+        ])
+      }
     }
+    let prompt = frameDescriptionPrompt(frameCount: validFrames.count)
+    parts.insert(["text": prompt], at: 0)
 
     let response = try await callGenerateContent(
       parts: parts,
@@ -65,9 +79,10 @@ extension GemmaBackupProvider {
       maxOutputTokens: 2048,
       logRequestBody: false
     )
+    parts.removeAll()
 
     let envelope = try parseJSONResponse(FrameDescriptionEnvelope.self, from: response)
-    return mapFrameDescriptions(envelope.frames, frames: frames)
+    return mapFrameDescriptions(envelope.frames, frames: validFrames)
   }
 
   func describeFramesInBatches(_ frames: [FrameData], batchSize: Int, batchId: Int64?)
@@ -79,16 +94,21 @@ extension GemmaBackupProvider {
     while startIndex < frames.count {
       let endIndex = min(frames.count, startIndex + batchSize)
       let subset = Array(frames[startIndex..<endIndex])
-      let prompt = frameDescriptionPrompt(frameCount: subset.count)
-      var parts: [[String: Any]] = [["text": prompt]]
+      var validSubset: [FrameData] = []
+      var parts: [[String: Any]] = []
       for frame in subset {
-        parts.append([
-          "inline_data": [
-            "mime_type": "image/jpeg",
-            "data": frame.base64Image,
-          ]
-        ])
+        if let base64 = encodeFrameBase64(frame) {
+          validSubset.append(frame)
+          parts.append([
+            "inline_data": [
+              "mime_type": "image/jpeg",
+              "data": base64,
+            ]
+          ])
+        }
       }
+      let prompt = frameDescriptionPrompt(frameCount: validSubset.count)
+      parts.insert(["text": prompt], at: 0)
 
       let response = try await callGenerateContent(
         parts: parts,
@@ -98,9 +118,10 @@ extension GemmaBackupProvider {
         maxOutputTokens: 2048,
         logRequestBody: false
       )
+      parts.removeAll()
 
       let envelope = try parseJSONResponse(FrameDescriptionEnvelope.self, from: response)
-      let mapped = mapFrameDescriptions(envelope.frames, frames: subset)
+      let mapped = mapFrameDescriptions(envelope.frames, frames: validSubset)
       results.append(contentsOf: mapped)
       startIndex = endIndex
     }

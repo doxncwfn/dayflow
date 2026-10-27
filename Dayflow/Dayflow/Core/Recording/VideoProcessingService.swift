@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreGraphics
+import Darwin
 import Foundation
 
 enum VideoProcessingError: Error {
@@ -44,7 +45,7 @@ actor VideoProcessingService {
     var keyframeIntervalSeconds: Int
 
     static let `default` = VideoEncodingOptions(
-      maxOutputHeight: nil,
+      maxOutputHeight: 720,
       frameStride: 1,
       averageBitRate: 2_000_000,
       codec: .h264,
@@ -145,14 +146,6 @@ actor VideoProcessingService {
       throw VideoProcessingError.noInputFiles
     }
 
-    guard let firstFrameSize = firstValidImageSize(in: selectedScreenshots) else {
-      throw VideoProcessingError.invalidImageData
-    }
-    let (width, height) = resolvedCanvasSize(
-      sourceWidth: firstFrameSize.width, sourceHeight: firstFrameSize.height,
-      maxOutputHeight: options.maxOutputHeight)
-    let scanDuration = Date().timeIntervalSince(scanStart)
-
     // Ensure output directory exists
     let outputDir = outputURL.deletingLastPathComponent()
     if !fileManager.fileExists(atPath: outputDir.path) {
@@ -161,6 +154,43 @@ actor VideoProcessingService {
     if fileManager.fileExists(atPath: outputURL.path) {
       try? fileManager.removeItem(at: outputURL)
     }
+
+    // Zero-copy passthrough remuxing: when screenshots reside in recorded .mp4 segments,
+    // stitch/trim the compressed bitstream directly via AVMutableComposition + AVAssetExportPresetPassthrough
+    // without decoding frames to CGImage or re-encoding via VideoToolbox.
+    if useCompressedTimeline && max(1, fps) == 1 {
+      if await tryPassthroughExport(screenshots: selectedScreenshots, outputURL: outputURL) {
+        let videoDuration = Double(selectedScreenshots.count) / Double(max(1, fps))
+        print(
+          "✅ Generated compressed video from \(selectedScreenshots.count) screenshots (\(videoDuration)s): \(outputURL.lastPathComponent)"
+        )
+        let totalDuration = Date().timeIntervalSince(overallStart)
+        print(
+          String(
+            format:
+              "TIMING timelapse_passthrough frames=%d/%d sampled=%d stride=%d total=%.3fs output=%@",
+            selectedScreenshots.count,
+            screenshots.count,
+            selectedScreenshots.count,
+            frameStride,
+            totalDuration,
+            outputURL.lastPathComponent
+          )
+        )
+        return
+      }
+      if fileManager.fileExists(atPath: outputURL.path) {
+        try? fileManager.removeItem(at: outputURL)
+      }
+    }
+
+    guard let firstFrameSize = firstValidImageSize(in: selectedScreenshots) else {
+      throw VideoProcessingError.invalidImageData
+    }
+    let (width, height) = resolvedCanvasSize(
+      sourceWidth: firstFrameSize.width, sourceHeight: firstFrameSize.height,
+      maxOutputHeight: options.maxOutputHeight)
+    let scanDuration = Date().timeIntervalSince(scanStart)
 
     // 2. Setup AVAssetWriter for H.264 video
     guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
@@ -192,6 +222,7 @@ actor VideoProcessingService {
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
         kCVPixelBufferWidthKey as String: width,
         kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferPoolMinimumBufferCountKey as String: 1,
       ]
     )
 
@@ -205,53 +236,71 @@ actor VideoProcessingService {
     }
     writer.startSession(atSourceTime: .zero)
 
+    defer {
+      if let pool = adaptor.pixelBufferPool {
+        CVPixelBufferPoolFlush(pool, .excessBuffers)
+      }
+      FrameStore.shared.clearReaders()
+      malloc_zone_pressure_relief(nil, 0)
+    }
+
     // 3. Write each screenshot as a frame
     let encodeStart = Date()
     var frameIndex = 0
     var skippedFrames = 0
     let baseTimestamp = selectedScreenshots.first!.capturedAt
     let pixelBufferPool = adaptor.pixelBufferPool
+    let maxDecodeDimension = max(width, height)
 
     for screenshot in selectedScreenshots {
-      guard let cgImage = screenshot.loadCGImage() else {
-        print("⚠️ Skipping undecodable screenshot \(screenshot.id)")
-        skippedFrames += 1
-        continue
-      }
-
-      // Create pixel buffer with aspect-fit compositing (letterbox/pillarbox as needed)
-      guard
-        let pixelBuffer = createPixelBuffer(
-          from: cgImage, canvasWidth: width, canvasHeight: height, pixelBufferPool: pixelBufferPool)
-      else {
-        print("⚠️ Failed to create pixel buffer for screenshot \(screenshot.id)")
-        skippedFrames += 1
-        continue
-      }
-
-      // Calculate presentation time
-      let presentationTime: CMTime
-      if useCompressedTimeline {
-        // Compressed: each frame is 1/fps seconds apart
-        // e.g., fps=2 means each frame is 0.5s apart (2 frames per second)
-        let frameTime = Double(frameIndex) / Double(safeFPS)
-        presentationTime = CMTime(seconds: frameTime, preferredTimescale: 600)
-      } else {
-        // Real timeline: use actual capture timestamps
-        let elapsedSeconds = Double(screenshot.capturedAt - baseTimestamp)
-        presentationTime = CMTime(seconds: elapsedSeconds, preferredTimescale: 600)
-      }
-
-      // Wait for writer to be ready
+      // Wait for writer to be ready before allocating/decoding frame buffers
       while !writerInput.isReadyForMoreMediaData {
         try await Task.sleep(nanoseconds: 10_000_000)  // 10ms
       }
 
-      // Append frame
-      if !adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
-        print("⚠️ Failed to append frame at \(CMTimeGetSeconds(presentationTime))s")
+      autoreleasepool {
+        guard
+          let cgImage = FrameStore.shared.image(
+            for: screenshot, maxPixelSize: maxDecodeDimension)
+        else {
+          print("⚠️ Skipping undecodable screenshot \(screenshot.id)")
+          skippedFrames += 1
+          return
+        }
+
+        // Create pixel buffer with aspect-fit compositing (letterbox/pillarbox as needed)
+        guard
+          let pixelBuffer = createPixelBuffer(
+            from: cgImage, canvasWidth: width, canvasHeight: height,
+            pixelBufferPool: pixelBufferPool)
+        else {
+          print("⚠️ Failed to create pixel buffer for screenshot \(screenshot.id)")
+          skippedFrames += 1
+          return
+        }
+
+        // Calculate presentation time
+        let presentationTime: CMTime
+        if useCompressedTimeline {
+          // Compressed: each frame is 1/fps seconds apart
+          // e.g., fps=2 means each frame is 0.5s apart (2 frames per second)
+          let frameTime = Double(frameIndex) / Double(safeFPS)
+          presentationTime = CMTime(seconds: frameTime, preferredTimescale: 600)
+        } else {
+          // Real timeline: use actual capture timestamps
+          let elapsedSeconds = Double(screenshot.capturedAt - baseTimestamp)
+          presentationTime = CMTime(seconds: elapsedSeconds, preferredTimescale: 600)
+        }
+
+        // Append frame
+        if !adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
+          print("⚠️ Failed to append frame at \(CMTimeGetSeconds(presentationTime))s")
+        }
+        if let pool = pixelBufferPool {
+          CVPixelBufferPoolFlush(pool, .excessBuffers)
+        }
+        frameIndex += 1
       }
-      frameIndex += 1
     }
     let encodeDuration = Date().timeIntervalSince(encodeStart)
 
@@ -318,10 +367,217 @@ actor VideoProcessingService {
     return sampled
   }
 
+  private struct SegmentRun {
+    let filePath: String
+    let startFrame: Int
+    var frameCount: Int
+  }
+
+  private struct LoadedSegmentTrack {
+    let asset: AVURLAsset
+    let track: AVAssetTrack
+    let naturalSize: CGSize
+    let timeRange: CMTimeRange
+    let mediaSubType: FourCharCode
+  }
+
+  /// Attempts to build `outputURL` by remuxing time ranges from the underlying `.mp4` segment
+  /// files via `AVAssetExportPresetPassthrough` with zero frame decoding or re-encoding.
+  private func tryPassthroughExport(screenshots: [Screenshot], outputURL: URL) async -> Bool {
+    guard !screenshots.isEmpty else { return false }
+    defer { malloc_zone_pressure_relief(nil, 0) }
+
+    // 1. Ensure all screenshots belong to .mp4 segments (not legacy JPEGs) and build contiguous runs.
+    var runs: [SegmentRun] = []
+    let activePath = FrameStore.shared.activeSegmentPath
+    var needsActiveSegmentFinalize = false
+
+    for screenshot in screenshots {
+      guard let frameIndex = screenshot.frameIndex, frameIndex >= 0 else {
+        return false
+      }
+      if screenshot.filePath == activePath {
+        needsActiveSegmentFinalize = true
+      }
+      if let last = runs.last,
+        last.filePath == screenshot.filePath,
+        frameIndex == last.startFrame + last.frameCount
+      {
+        runs[runs.count - 1].frameCount += 1
+      } else {
+        runs.append(
+          SegmentRun(filePath: screenshot.filePath, startFrame: frameIndex, frameCount: 1))
+      }
+    }
+
+    if needsActiveSegmentFinalize {
+      FrameStore.shared.finishCurrentSegment()
+    }
+
+    // 2. Load source tracks once per unique segment file and verify uniform dimensions & codec.
+    var loadedTracks: [String: LoadedSegmentTrack] = [:]
+    var expectedSize: CGSize?
+    var expectedSubType: FourCharCode?
+
+    for run in runs {
+      if loadedTracks[run.filePath] != nil { continue }
+      guard fileManager.fileExists(atPath: run.filePath) else { return false }
+      let asset = AVURLAsset(
+        url: URL(fileURLWithPath: run.filePath),
+        options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]
+      )
+      guard
+        let tracks = try? await asset.loadTracks(withMediaType: .video),
+        let track = tracks.first,
+        let naturalSize = try? await track.load(.naturalSize),
+        let timeRange = try? await track.load(.timeRange),
+        let formatDescriptions = try? await track.load(.formatDescriptions),
+        let firstFormat = formatDescriptions.first
+      else {
+        return false
+      }
+
+      let subType = CMFormatDescriptionGetMediaSubType(firstFormat)
+      if let expectedSize, expectedSize != naturalSize {
+        return false
+      }
+      if let expectedSubType, expectedSubType != subType {
+        return false
+      }
+      expectedSize = naturalSize
+      expectedSubType = subType
+
+      loadedTracks[run.filePath] = LoadedSegmentTrack(
+        asset: asset,
+        track: track,
+        naturalSize: naturalSize,
+        timeRange: timeRange,
+        mediaSubType: subType
+      )
+    }
+
+    // 3a. Fast path for a single segment file: either APFS clone the whole segment or trim the AVURLAsset directly.
+    if runs.count == 1, let run = runs.first, let source = loadedTracks[run.filePath] {
+      let trackDurationSeconds = CMTimeGetSeconds(source.timeRange.duration)
+      if run.startFrame == 0 && Double(run.frameCount) >= trackDurationSeconds {
+        do {
+          try fileManager.copyItem(at: URL(fileURLWithPath: run.filePath), to: outputURL)
+          let attrs = try? fileManager.attributesOfItem(atPath: outputURL.path)
+          let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+          if bytes > 0 { return true }
+        } catch {
+          try? fileManager.removeItem(at: outputURL)
+        }
+      }
+
+      let runStart = CMTime(value: CMTimeValue(run.startFrame), timescale: 1)
+      let runDuration = CMTime(value: CMTimeValue(run.frameCount), timescale: 1)
+      let trackEnd = CMTimeRangeGetEnd(source.timeRange)
+      if CMTimeCompare(runStart, trackEnd) < 0 {
+        let available = CMTimeSubtract(trackEnd, runStart)
+        let clampedDuration = CMTimeMinimum(runDuration, available)
+        if CMTimeCompare(clampedDuration, .zero) > 0,
+          let exportSession = AVAssetExportSession(
+            asset: source.asset,
+            presetName: AVAssetExportPresetPassthrough
+          )
+        {
+          exportSession.outputURL = outputURL
+          exportSession.outputFileType =
+            exportSession.supportedFileTypes.contains(.mp4)
+            ? .mp4 : (exportSession.supportedFileTypes.first ?? .mov)
+          exportSession.timeRange = CMTimeRange(start: runStart, duration: clampedDuration)
+          exportSession.shouldOptimizeForNetworkUse = false
+          await withCheckedContinuation { continuation in
+            exportSession.exportAsynchronously {
+              continuation.resume()
+            }
+          }
+          if exportSession.status == .completed {
+            let attrs = try? fileManager.attributesOfItem(atPath: outputURL.path)
+            let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            if bytes > 0 { return true }
+          }
+          try? fileManager.removeItem(at: outputURL)
+        }
+      }
+    }
+
+    // 3b. Multi-segment stitch into an AVMutableComposition.
+    let composition = AVMutableComposition()
+    guard
+      let compTrack = composition.addMutableTrack(
+        withMediaType: .video,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    else {
+      return false
+    }
+
+    var insertCursor = CMTime.zero
+    for run in runs {
+      guard let source = loadedTracks[run.filePath] else { return false }
+      let runStart = CMTime(value: CMTimeValue(run.startFrame), timescale: 1)
+      let runDuration = CMTime(value: CMTimeValue(run.frameCount), timescale: 1)
+      let trackEnd = CMTimeRangeGetEnd(source.timeRange)
+      guard CMTimeCompare(runStart, trackEnd) < 0 else { return false }
+      let available = CMTimeSubtract(trackEnd, runStart)
+      let clampedDuration = CMTimeMinimum(runDuration, available)
+      guard CMTimeCompare(clampedDuration, .zero) > 0 else { return false }
+
+      do {
+        try compTrack.insertTimeRange(
+          CMTimeRange(start: runStart, duration: clampedDuration),
+          of: source.track,
+          at: insertCursor
+        )
+        insertCursor = CMTimeAdd(insertCursor, clampedDuration)
+      } catch {
+        return false
+      }
+    }
+
+    guard CMTimeCompare(insertCursor, .zero) > 0 else { return false }
+
+    // 4. Export via AVAssetExportPresetPassthrough (zero decode / zero re-encode).
+    guard
+      let exportSession = AVAssetExportSession(
+        asset: composition,
+        presetName: AVAssetExportPresetPassthrough
+      )
+    else {
+      return false
+    }
+    exportSession.outputURL = outputURL
+    exportSession.outputFileType =
+      exportSession.supportedFileTypes.contains(.mp4)
+      ? .mp4 : (exportSession.supportedFileTypes.first ?? .mov)
+    exportSession.shouldOptimizeForNetworkUse = false
+
+    await withCheckedContinuation { continuation in
+      exportSession.exportAsynchronously {
+        continuation.resume()
+      }
+    }
+
+    guard exportSession.status == .completed else {
+      try? fileManager.removeItem(at: outputURL)
+      return false
+    }
+    let attrs = try? fileManager.attributesOfItem(atPath: outputURL.path)
+    let bytes = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+    return bytes > 0
+  }
+
   private func firstValidImageSize(in screenshots: [Screenshot]) -> (width: Int, height: Int)? {
     for screenshot in screenshots {
-      if let image = screenshot.loadCGImage(), image.width > 0, image.height > 0 {
+      if let size = autoreleasepool(invoking: { () -> (width: Int, height: Int)? in
+        guard let image = screenshot.loadCGImage(), image.width > 0, image.height > 0 else {
+          return nil
+        }
         return (image.width, image.height)
+      }) {
+        return size
       }
     }
     return nil

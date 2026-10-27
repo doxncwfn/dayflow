@@ -610,6 +610,8 @@ final class AnalysisManager: AnalysisManaging {
       [weak self] (result: Result<ProcessedBatchResult, Error>) in
       guard let self else { return }
       self.setBatchInFlight(batchId, false)
+      FrameStore.shared.clearReaders()
+      StorageManager.shared.shrinkMemory()
 
       let now = Date()
       let currentDayInfo = now.getDayInfoFor4AMBoundary()

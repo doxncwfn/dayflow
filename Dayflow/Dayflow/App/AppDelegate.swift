@@ -46,7 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var analyticsSub: AnyCancellable?
   private var analyticsPreferenceObserver: NSObjectProtocol?
   private var powerObserver: NSObjectProtocol?
-  private let screenshotShortcutTracker = ScreenshotShortcutTracker.shared
+  private lazy var screenshotShortcutTracker = ScreenshotShortcutTracker.shared
   private var deepLinkRouter: AppDeepLinkRouter?
   private var pendingDeepLinkURLs: [URL] = []
   private var heartbeatTimer: Timer?
@@ -54,6 +54,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var foregroundStartTime: Date?
   private var referralUsageStartedAt: Date?
   private var analyticsConfigured = false
+  private var sigtermSource: (any DispatchSourceSignal)?
+  private var isInitialLaunchSuppressed = true
+  private var isHeadlessExplicit: Bool {
+    CommandLine.arguments.contains("--background")
+      || ProcessInfo.processInfo.environment["DAYFLOW_BACKGROUND"] == "1"
+  }
+  private var isBackgroundLaunch: Bool {
+    if isHeadlessExplicit {
+      return true
+    }
+    let didOnboard = UserDefaults.standard.bool(forKey: "didOnboard")
+    let openWindowOnLaunch =
+      UserDefaults.standard.object(forKey: "openWindowOnLaunch") as? Bool ?? false
+    return didOnboard && !openWindowOnLaunch
+  }
 
   override init() {
     UserDefaultsMigrator.migrateIfNeeded()
@@ -65,7 +80,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ note: Notification) {
     // Block termination by default; only specific flows enable it.
     AppDelegate.allowTermination = false
-    applySavedDockIconPreference()
+    URLCache.shared = URLCache(memoryCapacity: 0, diskCapacity: 0, directory: nil)
+    if isHeadlessExplicit {
+      NSApp.setActivationPolicy(.accessory)
+    } else {
+      applySavedDockIconPreference()
+    }
+
+    signal(SIGTERM, SIG_IGN)
+    let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    sigterm.setEventHandler {
+      FrameStore.shared.finishCurrentSegment()
+      StorageManager.shared.checkpoint(mode: .truncate)
+      exit(0)
+    }
+    sigterm.resume()
+    self.sigtermSource = sigterm
     #if DEBUG
       if #available(macOS 15.0, *) { FlowDebugRecorder.shared.install() }
     #endif
@@ -181,16 +211,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Start Daily and Weekly notifications and retire legacy Journal reminders
     NotificationService.shared.start()
     DayflowAuthManager.shared.loadStoredSessionIfNeeded()
-    SupportChatSession.shared.start()
-    SupportChatSession.startFlowWaitlistMonitoring()
 
     // Start daily recap generation scheduler (checks every 5 minutes)
     DailyRecapScheduler.shared.start()
 
-    // Flow desktop overlay (creature toasts/nudges) tracks the session mirror
-    FlowOverlayController.shared.start()
-    FlowEarlyBirdController.shared.start()
+    // Flow desktop overlay and early-bird alerts start lazily when Flow is enabled
+    if DayflowAuthManager.shared.flowEnabled {
+      FlowOverlayController.shared.start()
+      FlowEarlyBirdController.shared.start()
+    }
     DailyBriefMenuBarNotice.shared.start()
+
+    if !isBackgroundLaunch {
+      MainWindowController.shared.showMainWindow()
+    } else {
+      if isHeadlessExplicit {
+        NSApp.setActivationPolicy(.accessory)
+      }
+      MainWindowController.shared.purgeUIMemory()
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+      self?.isInitialLaunchSuppressed = false
+    }
+
+    NotificationCenter.default.addObserver(
+      forName: NSApplication.didHideNotification,
+      object: nil,
+      queue: .main
+    ) { _ in
+      MainActor.assumeIsolated {
+        MainWindowController.shared.closeMainWindow()
+      }
+    }
 
     // Observe recording state
     analyticsSub = AppState.shared.$isRecording
@@ -239,11 +292,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     setupForegroundTracking()
   }
 
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool
+  {
+    if isInitialLaunchSuppressed {
+      return false
+    }
+    if !flag {
+      MainWindowController.shared.showMainWindow()
+    }
+    return true
+  }
+
+  func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+    return false
+  }
+
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     if Self.allowTermination {
       return .terminateNow
     }
-    // Soft-quit: hide windows and remove Dock icon, but keep status item + background tasks
+    // Soft-quit: close and release the main window, hide, and remove Dock icon
+    MainWindowController.shared.closeMainWindow()
     NSApp.hide(nil)
     NSApp.setActivationPolicy(.accessory)
     return .terminateCancel
@@ -321,6 +390,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    FrameStore.shared.finishCurrentSegment()
     // Checkpoint WAL to persist any pending database changes before quit
     // Using .truncate to also reset the WAL file for a clean state
     StorageManager.shared.checkpoint(mode: .truncate)

@@ -18,6 +18,12 @@ final class OtherSettingsViewModel: ObservableObject {
       NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
     }
   }
+  @Published var openWindowOnLaunch: Bool {
+    didSet {
+      guard openWindowOnLaunch != oldValue else { return }
+      UserDefaults.standard.set(openWindowOnLaunch, forKey: "openWindowOnLaunch")
+    }
+  }
   @Published var showTimelineAppIcons: Bool {
     didSet {
       guard showTimelineAppIcons != oldValue else { return }
@@ -59,6 +65,8 @@ final class OtherSettingsViewModel: ObservableObject {
   init() {
     analyticsEnabled = AnalyticsService.shared.isOptedIn
     showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? true
+    openWindowOnLaunch =
+      UserDefaults.standard.object(forKey: "openWindowOnLaunch") as? Bool ?? false
     showTimelineAppIcons =
       UserDefaults.standard.object(forKey: "showTimelineAppIcons") as? Bool ?? true
     showDailyGoalPopups = DayGoalPreferences.showDailyGoalPopups

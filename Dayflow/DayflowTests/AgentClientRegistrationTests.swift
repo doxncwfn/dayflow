@@ -170,7 +170,7 @@ final class AgentClientRegistrationTests: XCTestCase {
 
     XCTAssertEqual(
       registration.connect(),
-      .failed("Codex couldn't connect the Dayflow connection: permission denied")
+      .failed("Codex couldn't connect to Dayflow: permission denied")
     )
   }
 

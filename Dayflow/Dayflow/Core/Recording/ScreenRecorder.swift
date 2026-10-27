@@ -10,6 +10,7 @@
 import AppKit
 import Combine
 import CoreGraphics
+import CoreMedia
 import Foundation
 @preconcurrency import ScreenCaptureKit
 import Sentry
@@ -592,19 +593,23 @@ final class ScreenRecorder: NSObject, @unchecked Sendable {
 
       config.width = captureSize.width
       config.height = captureSize.height
+      config.pixelFormat = kCVPixelFormatType_32BGRA
       config.scalesToFit = true
       config.showsCursor = true
+      config.queueDepth = 3
+      config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-      // 3. Capture screenshot
+      // 3. Capture GPU-backed sample buffer directly (zero CGImage copy)
       monitor.recordRequest(.screenshot, source: .recorderCapture)
-      let image = try await SCScreenshotManager.captureImage(
+      let sampleBuffer = try await SCScreenshotManager.captureSampleBuffer(
         contentFilter: filter,
         configuration: config
       )
 
-      // 4. Encode into the current HEVC segment and register in the database
-      try appendFrame(image, capturedAt: captureTime, idleSecondsAtCapture: idleSecondsAtCapture)
-      dbg("📸 Frame appended (\(image.width)x\(image.height))")
+      // 4. Encode directly from the sample buffer's CVPixelBuffer into the current segment
+      try appendSampleBuffer(
+        sampleBuffer, capturedAt: captureTime, idleSecondsAtCapture: idleSecondsAtCapture)
+      dbg("📸 Frame sampleBuffer appended (\(captureSize.width)x\(captureSize.height))")
       return .succeeded
 
     } catch {
@@ -625,6 +630,24 @@ final class ScreenRecorder: NSObject, @unchecked Sendable {
     }
   }
 
+  /// Appends a GPU-backed `CMSampleBuffer` directly to `FrameStore` without creating a `CGImage`.
+  private func appendSampleBuffer(
+    _ sampleBuffer: CMSampleBuffer, capturedAt: Date, idleSecondsAtCapture: Int?
+  ) throws {
+    guard state == .capturing else {
+      dbg("frame dropped - recorder stopped mid-capture")
+      return
+    }
+    let screenshotId: Int64? = autoreleasepool {
+      FrameStore.shared.append(
+        sampleBuffer, capturedAt: capturedAt, idleSecondsAtCapture: idleSecondsAtCapture)
+    }
+    guard screenshotId != nil else {
+      throw ScreenRecorderError.imageConversionFailed
+    }
+  }
+
+  /// Fallback path for privacy placeholder `CGImage`s.
   /// Re-checks state right before writing so a capture that was in flight during
   /// `stop()` does not reopen a segment that would then sit open through sleep.
   private func appendFrame(_ image: CGImage, capturedAt: Date, idleSecondsAtCapture: Int?) throws {
@@ -632,19 +655,25 @@ final class ScreenRecorder: NSObject, @unchecked Sendable {
       dbg("frame dropped - recorder stopped mid-capture")
       return
     }
-    let screenshotId = FrameStore.shared.append(
-      image, capturedAt: capturedAt, idleSecondsAtCapture: idleSecondsAtCapture)
+    let screenshotId: Int64? = autoreleasepool {
+      FrameStore.shared.append(
+        image, capturedAt: capturedAt, idleSecondsAtCapture: idleSecondsAtCapture)
+    }
     guard screenshotId != nil else {
       throw ScreenRecorderError.imageConversionFailed
     }
   }
 
   private func scaledCaptureSize(for display: SCDisplay) -> (width: Int, height: Int) {
-    let targetHeight = Double(ScreenshotConfig.captureHeight)
+    let targetHeight = min(Double(ScreenshotConfig.captureHeight), 720.0)
     let aspectRatio = Double(display.width) / Double(display.height)
     var width = Int(targetHeight * aspectRatio)
-    if width % 2 != 0 { width += 1 }
     var height = Int(targetHeight)
+    if width > 1280 {
+      width = 1280
+      height = Int(1280.0 / aspectRatio)
+    }
+    if width % 2 != 0 { width += 1 }
     if height % 2 != 0 { height += 1 }
     return (width, height)
   }

@@ -20,15 +20,35 @@ extension GeminiDirectProvider {
     compressionFactor: TimeInterval,
     batchId: Int64?
   ) async throws -> (observations: [Observation], log: LLMCall) {
-    let callStart = Date()
-
-    // First, save video data to a temporary file
     let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(
       "\(UUID().uuidString).mp4")
-    try videoData.write(to: tempURL)
+    try autoreleasepool {
+      try videoData.write(to: tempURL, options: .atomic)
+    }
     defer { try? FileManager.default.removeItem(at: tempURL) }
+    return try await transcribeVideoFile(
+      tempURL,
+      mimeType: mimeType,
+      batchStartTime: batchStartTime,
+      videoDuration: videoDuration,
+      realDuration: realDuration,
+      compressionFactor: compressionFactor,
+      batchId: batchId
+    )
+  }
 
-    let fileURI = try await uploadAndAwait(tempURL, mimeType: mimeType, key: apiKey).1
+  func transcribeVideoFile(
+    _ videoFileURL: URL,
+    mimeType: String,
+    batchStartTime: Date,
+    videoDuration: TimeInterval,
+    realDuration: TimeInterval,
+    compressionFactor: TimeInterval,
+    batchId: Int64?
+  ) async throws -> (observations: [Observation], log: LLMCall) {
+    let callStart = Date()
+
+    let fileURI = try await uploadAndAwait(videoFileURL, mimeType: mimeType, key: apiKey).1
 
     // Format compressed video duration for the prompt
     let durationMinutes = Int(videoDuration / 60)
@@ -303,9 +323,7 @@ extension GeminiDirectProvider {
     let requestStart = Date()
 
     do {
-      request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-
-      let (data, response) = try await URLSession.shared.data(for: request)
+      let (data, response) = try await LLMURLSession.uploadJSONObject(requestBody, for: request)
       let requestDuration = Date().timeIntervalSince(requestStart)
 
       guard let httpResponse = response as? HTTPURLResponse else {
@@ -699,15 +717,15 @@ extension GeminiDirectProvider {
       )
     }
 
-    // Load video data
-    let videoData = try Data(contentsOf: tempVideoURL)
+    let attrs = try? FileManager.default.attributesOfItem(atPath: tempVideoURL.path)
+    let fileSizeKB = ((attrs?[.size] as? NSNumber)?.int64Value ?? 0) / 1024
     print(
-      "[Gemini] 📹 Composited \(screenshots.count) screenshots into compressed video (\(videoData.count / 1024)KB)"
+      "[Gemini] 📹 Composited \(screenshots.count) screenshots into compressed video (\(fileSizeKB)KB)"
     )
 
-    // Transcribe the composited video with compression info
-    return try await transcribeVideoData(
-      videoData,
+    // Transcribe the composited video file directly from disk without loading into Data
+    return try await transcribeVideoFile(
+      tempVideoURL,
       mimeType: "video/mp4",
       batchStartTime: batchStartTime,
       videoDuration: compressedVideoDuration,

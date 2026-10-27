@@ -8,7 +8,7 @@ import Foundation
 
 extension OllamaProvider {
   private struct FrameData {
-    let image: Data  // Base64 encoded image
+    let screenshot: Screenshot
     let timestamp: TimeInterval  // Seconds from batch start
   }
 
@@ -30,26 +30,29 @@ extension OllamaProvider {
       ✗ "Working on computer" (completely non-specific)
       """
 
-    // Convert base64 data back to string (return nil if we can't decode)
-    guard let base64String = String(data: frame.image, encoding: .utf8) else {
+    guard
+      let request: ChatRequest = autoreleasepool(invoking: {
+        guard let imageData = frame.screenshot.jpegData(maxHeight: 720, quality: 0.65) else {
+          return nil
+        }
+        let base64String = imageData.base64EncodedString()
+        let content: [MessageContent] = [
+          MessageContent(type: "text", text: prompt, image_url: nil),
+          MessageContent(
+            type: "image_url", text: nil,
+            image_url: MessageContent.ImageURL(url: "data:image/jpeg;base64,\(base64String)")),
+        ]
+        return ChatRequest(
+          model: savedModelId,
+          messages: [
+            ChatMessage(role: "user", content: content)
+          ]
+        )
+      })
+    else {
       print("[OLLAMA] ⚠️ Failed to decode frame image — skipping frame")
       return nil
     }
-
-    // Build message content with image and text
-    let content: [MessageContent] = [
-      MessageContent(type: "text", text: prompt, image_url: nil),
-      MessageContent(
-        type: "image_url", text: nil,
-        image_url: MessageContent.ImageURL(url: "data:image/jpeg;base64,\(base64String)")),
-    ]
-
-    let request = ChatRequest(
-      model: savedModelId,
-      messages: [
-        ChatMessage(role: "user", content: content)
-      ]
-    )
 
     do {
       let response = try await callChatAPI(
@@ -479,13 +482,10 @@ extension OllamaProvider {
 
     // Describe each screenshot
     var frameDescriptions: [(timestamp: TimeInterval, description: String)] = []
+    defer { FrameStore.shared.clearReaders() }
 
     for screenshot in sampledScreenshots {
-      guard let frameData = loadScreenshotAsFrameData(screenshot, relativeTo: firstTs) else {
-        print("[OLLAMA] ⚠️ Failed to load screenshot: \(screenshot.filePath)")
-        continue
-      }
-
+      let frameData = loadScreenshotAsFrameData(screenshot, relativeTo: firstTs)
       if let description = await getSimpleFrameDescription(frameData, batchId: batchId) {
         frameDescriptions.append((timestamp: frameData.timestamp, description: description))
       }
@@ -522,18 +522,11 @@ extension OllamaProvider {
     return (observations, log)
   }
 
-  /// Load a screenshot file and convert it to FrameData for description
+  /// Create a lightweight FrameData reference without decoding or base64-encoding upfront
   private func loadScreenshotAsFrameData(_ screenshot: Screenshot, relativeTo baseTimestamp: Int)
-    -> FrameData?
+    -> FrameData
   {
-    guard let imageData = screenshot.jpegData(maxHeight: 720, quality: 0.85) else {
-      return nil
-    }
-
-    let base64String = imageData.base64EncodedString()
-    let base64Data = Data(base64String.utf8)
     let relativeTimestamp = TimeInterval(screenshot.capturedAt - baseTimestamp)
-
-    return FrameData(image: base64Data, timestamp: relativeTimestamp)
+    return FrameData(screenshot: screenshot, timestamp: relativeTimestamp)
   }
 }

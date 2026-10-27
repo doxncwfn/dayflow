@@ -89,9 +89,13 @@ final class DailyBriefMenuBarNotice {
         context.duration = 0.2
         panel.animator().alphaValue = 0
       },
-      completionHandler: {
+      completionHandler: { [weak self] in
         Task { @MainActor in
-          if panel.alphaValue == 0 { panel.orderOut(nil) }
+          if panel.alphaValue == 0 {
+            panel.orderOut(nil)
+            panel.contentView = nil
+            self?.panel = nil
+          }
         }
       })
   }

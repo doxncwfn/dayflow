@@ -221,6 +221,7 @@ final class AnalyticsService {
   private let backendAuthOverrideTokenKey = "dayflowBackendAuthTokenOverride"
   private let throttleLock = NSLock()
   private var throttles: [String: Date] = [:]
+  private var isStarted = false
 
   var isOptedIn: Bool {
     get {
@@ -236,15 +237,21 @@ final class AnalyticsService {
   }
 
   func start(apiKey: String, host: String) {
+    guard !apiKey.isEmpty else { return }
     let config = PostHogConfig(apiKey: apiKey, host: host)
     let optedIn = isOptedIn
-    // Disable autocapture for privacy
+    // Disable autocapture and heavy in-memory replay/swizzling
     config.captureApplicationLifecycleEvents = false
+    config.captureScreenViews = false
     // Keep SDK initialized for backend auth token usage, but hard-disable networked telemetry when opted out.
     config.optOut = !optedIn
-    config.preloadFeatureFlags = optedIn
-    config.remoteConfig = optedIn
+    config.preloadFeatureFlags = false
+    config.remoteConfig = false
+    config.sendFeatureFlagEvent = false
+    config.maxBatchSize = 10
+    config.maxQueueSize = 50
     PostHogSDK.shared.setup(config)
+    isStarted = true
 
     guard optedIn else { return }
 
@@ -348,7 +355,7 @@ final class AnalyticsService {
 
   /// The PostHog distinct ID, or nil when analytics are opted out or the SDK has no identity yet.
   func currentDistinctId() -> String? {
-    guard isOptedIn else { return nil }
+    guard isStarted, isOptedIn else { return nil }
     let distinctId = PostHogSDK.shared.getDistinctId().trimmingCharacters(
       in: .whitespacesAndNewlines)
     return distinctId.isEmpty ? nil : distinctId
@@ -359,7 +366,9 @@ final class AnalyticsService {
     isOptedIn = enabled
 
     if enabled {
-      PostHogSDK.shared.optIn()
+      if isStarted {
+        PostHogSDK.shared.optIn()
+      }
       SentryHelper.setEnabled(true)
       NotificationCenter.default.post(
         name: .analyticsPreferenceChanged,
@@ -367,7 +376,7 @@ final class AnalyticsService {
         userInfo: ["enabled": enabled]
       )
 
-      guard previousValue != enabled else { return }
+      guard isStarted, previousValue != enabled else { return }
 
       let payload: [String: Any] = ["$set": sanitize(["analytics_opt_in": enabled])]
       Task.detached(priority: .utility) {
@@ -379,7 +388,9 @@ final class AnalyticsService {
 
     guard previousValue != enabled else {
       SentryHelper.setEnabled(false)
-      PostHogSDK.shared.optOut()
+      if isStarted {
+        PostHogSDK.shared.optOut()
+      }
       NotificationCenter.default.post(
         name: .analyticsPreferenceChanged,
         object: nil,
@@ -390,11 +401,13 @@ final class AnalyticsService {
 
     // Disable Sentry immediately, then send one final explicit PostHog opt-out signal.
     SentryHelper.setEnabled(false)
-    let payload: [String: Any] = ["$set": sanitize(["analytics_opt_in": enabled])]
-    PostHogSDK.shared.capture("person_props_updated", properties: payload)
-    PostHogSDK.shared.capture("analytics_opt_in_changed", properties: ["enabled": enabled])
-    PostHogSDK.shared.flush()
-    PostHogSDK.shared.optOut()
+    if isStarted {
+      let payload: [String: Any] = ["$set": sanitize(["analytics_opt_in": enabled])]
+      PostHogSDK.shared.capture("person_props_updated", properties: payload)
+      PostHogSDK.shared.capture("analytics_opt_in_changed", properties: ["enabled": enabled])
+      PostHogSDK.shared.flush()
+      PostHogSDK.shared.optOut()
+    }
     NotificationCenter.default.post(
       name: .analyticsPreferenceChanged,
       object: nil,
@@ -403,18 +416,18 @@ final class AnalyticsService {
   }
 
   func capture(_ name: String, _ props: [String: Any] = [:]) {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     let sanitized = sanitize(props)
     PostHogSDK.shared.capture(name, properties: sanitized)
   }
 
   func flush() {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     PostHogSDK.shared.flush()
   }
 
   func featureFlagVariant(_ key: String) -> String? {
-    guard isOptedIn else { return nil }
+    guard isStarted, isOptedIn else { return nil }
     return PostHogSDK.shared.getFeatureFlag(key) as? String
   }
 
@@ -424,7 +437,7 @@ final class AnalyticsService {
   }
 
   func identify(_ distinctId: String, properties: [String: Any] = [:]) {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     Task.detached(priority: .utility) {
       PostHogSDK.shared.identify(distinctId)
     }
@@ -434,14 +447,14 @@ final class AnalyticsService {
   }
 
   func alias(_ aliasId: String) {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     Task.detached(priority: .utility) {
       PostHogSDK.shared.alias(aliasId)
     }
   }
 
   func registerSuperProperties(_ props: [String: Any]) {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     let sanitized = sanitize(props)
     Task.detached(priority: .utility) {
       PostHogSDK.shared.register(sanitized)
@@ -449,7 +462,7 @@ final class AnalyticsService {
   }
 
   func setPersonProperties(_ props: [String: Any]) {
-    guard isOptedIn else { return }
+    guard isStarted, isOptedIn else { return }
     let payload: [String: Any] = ["$set": sanitize(props)]
     Task.detached(priority: .utility) {
       PostHogSDK.shared.capture("person_props_updated", properties: payload)

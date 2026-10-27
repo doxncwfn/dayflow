@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import SwiftUI
 
 final class FaviconService {
@@ -8,6 +9,16 @@ final class FaviconService {
   private let cache = NSCache<NSString, NSImage>()
   private var inFlight: [String: Task<NSImage?, Never>] = [:]
   private let inFlightLock = NSLock()
+  private let session: URLSession = {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = 4
+    config.timeoutIntervalForResource = 6
+    config.urlCache = nil
+    config.requestCachePolicy = .reloadIgnoringLocalCacheData
+    config.httpCookieStorage = nil
+    config.httpShouldSetCookies = false
+    return URLSession(configuration: config)
+  }()
   private let hostAliases: [String: String] = [
     "codex.com": "chatgpt.com",
     "codex.so": "chatgpt.com",
@@ -124,7 +135,11 @@ final class FaviconService {
   ]
 
   private init() {
-    cache.countLimit = 256
+    cache.countLimit = 64
+  }
+
+  func clearCache() {
+    cache.removeAllObjects()
   }
 
   /// Fetches favicon using raw strings for pattern matching, normalized hosts for network fetch.
@@ -299,23 +314,30 @@ final class FaviconService {
     guard let url = url else { return nil }
     var req = URLRequest(url: url)
     req.timeoutInterval = 4
+    req.cachePolicy = .reloadIgnoringLocalCacheData
     req.setValue("image/*", forHTTPHeaderField: "Accept")
-    let config = URLSessionConfiguration.ephemeral
-    config.timeoutIntervalForRequest = 4
-    config.timeoutIntervalForResource = 6
-    let session = URLSession(configuration: config)
     do {
       let (data, resp) = try await session.data(for: req)
       guard let http = resp as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else {
         return nil
       }
-      if let img = NSImage(data: data), img.size.width > 0, img.size.height > 0 {
-        return img
+      return autoreleasepool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+          kCGImageSourceCreateThumbnailFromImageAlways: true,
+          kCGImageSourceShouldCacheImmediately: true,
+          kCGImageSourceCreateThumbnailWithTransform: true,
+          kCGImageSourceThumbnailMaxPixelSize: 32,
+        ]
+        guard let cgImg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else {
+          return nil
+        }
+        return NSImage(cgImage: cgImg, size: NSSize(width: cgImg.width, height: cgImg.height))
       }
     } catch {
       return nil
     }
-    return nil
   }
 
   private func existingTask(for host: String) -> Task<NSImage?, Never>? {

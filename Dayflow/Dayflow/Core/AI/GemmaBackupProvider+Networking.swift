@@ -26,11 +26,9 @@ extension GemmaBackupProvider {
       ],
     ]
 
-    let requestData = try JSONSerialization.data(withJSONObject: requestBody)
-    request.httpBody = requestData
-
     let requestStart = Date()
-    let logBody = logRequestBody ? requestData : nil
+    let logBody: Data? =
+      logRequestBody ? (try? JSONSerialization.data(withJSONObject: requestBody)) : nil
 
     let ctx = LLMCallContext(
       batchId: batchId,
@@ -49,7 +47,7 @@ extension GemmaBackupProvider {
     let data: Data
     let response: URLResponse
     do {
-      (data, response) = try await URLSession.shared.data(for: request)
+      (data, response) = try await LLMURLSession.uploadJSONObject(requestBody, for: request)
     } catch {
       LLMLogger.logFailure(
         ctx: ctx,

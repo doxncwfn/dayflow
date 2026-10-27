@@ -398,9 +398,7 @@ extension GeminiDirectProvider {
     let requestStart = Date()
 
     do {
-      request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-
-      let (data, response) = try await URLSession.shared.data(for: request)
+      let (data, response) = try await LLMURLSession.uploadJSONObject(requestBody, for: request)
       let requestDuration = Date().timeIntervalSince(requestStart)
 
       guard let httpResponse = response as? HTTPURLResponse else {

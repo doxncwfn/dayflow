@@ -13,7 +13,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
   /// when the label actually changes.
   private var flowPillLabel: String??
   /// The same countdown, for the hero at the top of the open menu.
-  private let flowClock = FlowMenuClock()
+  private lazy var flowClock = FlowMenuClock()
 
   /// The live controller, so floating cards (like the Daily brief notice) can
   /// sit under the menu bar icon.
@@ -40,6 +40,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         self?.updateIcon(isRecording: isRecording)
       }
 
+    // Only instantiate FlowSessionMirror on launch if a persisted session is active.
+    if FlowSessionMirror.isInstantiated || FlowSessionMirror.hasPersistedActiveSession {
+      bindFlowSessionIfNeeded()
+    }
+  }
+
+  func bindFlowSessionIfNeeded() {
+    guard flowCancellable == nil else { return }
     // While a Flow session is on, the icon gives way to the Flow pill.
     flowCancellable = FlowSessionMirror.shared.$snapshot
       .removeDuplicates()
@@ -58,7 +66,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
   }
 
   private func updateIcon(isRecording: Bool) {
-    guard !FlowSessionMirror.shared.isSessionOn else { return }
+    if FlowSessionMirror.isInstantiated, FlowSessionMirror.shared.isSessionOn {
+      return
+    }
     statusItem.button?.image = menuBarIcon(isRecording: isRecording)
   }
 
@@ -158,7 +168,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
   func menuNeedsUpdate(_ menu: NSMenu) {
     menu.removeAllItems()
 
-    if FlowSessionMirror.shared.isSessionOn {
+    if FlowSessionMirror.isInstantiated && FlowSessionMirror.shared.isSessionOn {
       menu.addItem(flowSessionHeroItem())
     }
 
@@ -184,6 +194,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
       actionItem(
         String(localized: "Quit Completely"), #selector(quitDayflow), keyEquivalent: "q",
         symbol: "power", tint: .systemRed))
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    menu.removeAllItems()
   }
 
   private func resumeItem() -> NSMenuItem {

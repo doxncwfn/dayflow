@@ -105,18 +105,22 @@ final class OpenAICompatibleProvider: ChatGPTTimelinePromptSupporting {
       sorted[count == 1 ? 0 : index * (sorted.count - 1) / (count - 1)]
     }
     let duration = max(1, TimeInterval(last.capturedAt - first.capturedAt))
+    defer { FrameStore.shared.clearReaders() }
     var images: [MessageContent] = []
     var validFrameCount = 0
     for screenshot in selected {
-      guard let jpeg = screenshot.jpegData(maxHeight: 720, quality: 0.85) else { continue }
-      let timestamp = formatSeconds(TimeInterval(screenshot.capturedAt - first.capturedAt))
-      images.append(.init(type: "text", text: "Screenshot at \(timestamp):", image_url: nil))
-      images.append(
-        .init(
-          type: "image_url", text: nil,
-          image_url: .init(url: "data:image/jpeg;base64,\(jpeg.base64EncodedString())")))
-      validFrameCount += 1
+      autoreleasepool {
+        guard let jpeg = screenshot.jpegData(maxHeight: 720, quality: 0.65) else { return }
+        let timestamp = formatSeconds(TimeInterval(screenshot.capturedAt - first.capturedAt))
+        images.append(.init(type: "text", text: "Screenshot at \(timestamp):", image_url: nil))
+        images.append(
+          .init(
+            type: "image_url", text: nil,
+            image_url: .init(url: "data:image/jpeg;base64,\(jpeg.base64EncodedString())")))
+        validFrameCount += 1
+      }
     }
+    FrameStore.shared.clearReaders()
     guard validFrameCount > 0 else { throw invalidOutput("No readable screenshots to transcribe.") }
     let prompt = buildScreenshotTranscriptionPrompt(
       numFrames: validFrameCount, duration: formatSeconds(duration),

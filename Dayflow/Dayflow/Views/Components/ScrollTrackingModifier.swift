@@ -4,25 +4,27 @@ import SwiftUI
 /// Observes the underlying NSScrollView's clip view bounds changes.
 /// Unlike SwiftUI's PreferenceKey approach, this fires continuously during active scrolling.
 private struct ScrollObserverView: NSViewRepresentable {
-  let onScroll: (_ offset: CGFloat, _ delta: CGFloat) -> Void
+  let onScrollStart: ((_ direction: String) -> Void)?
 
   func makeNSView(context: Context) -> NSView {
     let view = ScrollObserverNSView()
-    view.onScroll = onScroll
+    view.onScrollStart = onScrollStart
     return view
   }
 
   func updateNSView(_ nsView: NSView, context: Context) {
     if let observer = nsView as? ScrollObserverNSView {
-      observer.onScroll = onScroll
+      observer.onScrollStart = onScrollStart
     }
   }
 
   private class ScrollObserverNSView: NSView {
-    var onScroll: ((_ offset: CGFloat, _ delta: CGFloat) -> Void)?
+    var onScrollStart: ((_ direction: String) -> Void)?
     private var lastOffset: CGFloat?
     private var scrollViewObservation: NSObjectProtocol?
     private var isReady = false
+    private var isScrolling = false
+    private var scrollResetWorkItem: DispatchWorkItem?
 
     override func viewDidMoveToWindow() {
       super.viewDidMoveToWindow()
@@ -30,6 +32,16 @@ private struct ScrollObserverView: NSViewRepresentable {
       // Reset state when view is (re-)added to window
       isReady = false
       lastOffset = nil
+      guard window != nil else {
+        scrollResetWorkItem?.cancel()
+        scrollResetWorkItem = nil
+        isScrolling = false
+        if let observation = scrollViewObservation {
+          NotificationCenter.default.removeObserver(observation)
+          scrollViewObservation = nil
+        }
+        return
+      }
       setupScrollObserver()
 
       // Ignore initial layout bounds changes
@@ -56,8 +68,9 @@ private struct ScrollObserverView: NSViewRepresentable {
         forName: NSView.boundsDidChangeNotification,
         object: scrollView.contentView,
         queue: .main
-      ) { [weak self] _ in
-        self?.handleBoundsChange(scrollView: scrollView)
+      ) { [weak self, weak scrollView] _ in
+        guard let self, let scrollView else { return }
+        self.handleBoundsChange(scrollView: scrollView)
       }
     }
 
@@ -78,7 +91,17 @@ private struct ScrollObserverView: NSViewRepresentable {
       if isReady, let last = lastOffset {
         let delta = currentOffset - last
         if abs(delta) > 0.5 {
-          onScroll?(currentOffset, delta)
+          if !isScrolling {
+            let direction = delta > 0 ? "down" : "up"
+            onScrollStart?(direction)
+            isScrolling = true
+          }
+          scrollResetWorkItem?.cancel()
+          let resetWork = DispatchWorkItem { [weak self] in
+            self?.isScrolling = false
+          }
+          scrollResetWorkItem = resetWork
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: resetWork)
         }
       }
 
@@ -86,6 +109,7 @@ private struct ScrollObserverView: NSViewRepresentable {
     }
 
     deinit {
+      scrollResetWorkItem?.cancel()
       if let observation = scrollViewObservation {
         NotificationCenter.default.removeObserver(observation)
       }
@@ -99,37 +123,12 @@ private struct ScrollTrackingModifier: ViewModifier {
   let panelName: String
   let onScrollStart: ((_ direction: String) -> Void)?
 
-  @State private var isScrolling = false
-  @State private var scrollResetWork: DispatchWorkItem?
-
   func body(content: Content) -> some View {
     content
       .background(
-        ScrollObserverView { offset, delta in
-          handleScroll(delta: delta)
-        }
-        .allowsHitTesting(false)
+        ScrollObserverView(onScrollStart: onScrollStart)
+          .allowsHitTesting(false)
       )
-  }
-
-  private func handleScroll(delta: CGFloat) {
-    // Defer state modifications to avoid "Modifying state during view update"
-    DispatchQueue.main.async {
-      // Fire event once when scrolling starts
-      if !isScrolling {
-        let direction = delta > 0 ? "down" : "up"
-        onScrollStart?(direction)
-        isScrolling = true
-      }
-
-      // Reset isScrolling after 0.6s of no scroll activity
-      scrollResetWork?.cancel()
-      let resetWork = DispatchWorkItem {
-        isScrolling = false
-      }
-      scrollResetWork = resetWork
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: resetWork)
-    }
   }
 }
 

@@ -23,7 +23,16 @@ final class ScreenshotThumbnailCache {
   private var inflight: [String: [(NSImage?) -> Void]] = [:]
 
   private init() {
-    cache.countLimit = 64
+    cache.countLimit = 24
+    cache.totalCostLimit = 8 * 1024 * 1024
+  }
+
+  func clear() {
+    queue.cancelAllOperations()
+    cache.removeAllObjects()
+    syncQueue.async { [weak self] in
+      self?.inflight.removeAll()
+    }
   }
 
   func fetchThumbnail(
@@ -51,9 +60,12 @@ final class ScreenshotThumbnailCache {
 
     queue.addOperation { [weak self] in
       guard let self else { return }
-      let image = self.generateThumbnail(screenshot: screenshot, targetSize: targetSize)
+      let image = autoreleasepool {
+        self.generateThumbnail(screenshot: screenshot, targetSize: targetSize)
+      }
       if let image {
-        self.cache.setObject(image, forKey: key as NSString)
+        let cost = Int(image.size.width * image.size.height * 4)
+        self.cache.setObject(image, forKey: key as NSString, cost: max(1, cost))
       }
       self.finish(key: key, image: image)
     }

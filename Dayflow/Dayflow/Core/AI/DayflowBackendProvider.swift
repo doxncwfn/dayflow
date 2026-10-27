@@ -276,7 +276,7 @@ final class DayflowBackendProvider {
       )
 
       let requestByteCount = urlRequest.httpBody?.count ?? 0
-      let (data, response) = try await URLSession.shared.data(for: urlRequest)
+      let (data, response) = try await LLMURLSession.data(for: urlRequest)
       responseByteCount = data.count
 
       guard let httpResponse = response as? HTTPURLResponse else {
@@ -363,9 +363,8 @@ final class DayflowBackendProvider {
 
   /// Matches the server's MAX_SCREENSHOTS_PER_REQUEST so we never upload frames it would discard.
   private static let maxFramesPerBatch = 15
-  /// Frames for one-step timeline generation go up larger than for transcription; small text
-  /// has to stay readable because no second pass sees the screen.
-  private static let timelineFrameMaxHeight = 1080
+  /// Frames for one-step timeline generation are capped at 720p to keep memory footprint low.
+  private static let timelineFrameMaxHeight = 720
   private static let timelineRequestTimeout: TimeInterval = 180
 
   /// Picks `maxCount` evenly spaced frames, the same way the backend samples them.
@@ -393,14 +392,18 @@ final class DayflowBackendProvider {
 
     let sortedScreenshots = screenshots.sorted { $0.capturedAt < $1.capturedAt }
     let sampledScreenshots = Self.evenlySampled(sortedScreenshots, maxCount: Self.maxFramesPerBatch)
+    defer { FrameStore.shared.clearReaders() }
     let screenshotPayloads = sampledScreenshots.compactMap {
       screenshot -> DayflowScreenshotPayload? in
-      guard let data = screenshot.jpegData(maxHeight: 720, quality: 0.85) else { return nil }
-      return DayflowScreenshotPayload(
-        capturedAt: screenshot.capturedAt,
-        imageBase64: data.base64EncodedString()
-      )
+      autoreleasepool {
+        guard let data = screenshot.jpegData(maxHeight: 720, quality: 0.65) else { return nil }
+        return DayflowScreenshotPayload(
+          capturedAt: screenshot.capturedAt,
+          imageBase64: data.base64EncodedString()
+        )
+      }
     }
+    FrameStore.shared.clearReaders()
 
     guard !screenshotPayloads.isEmpty else {
       throw NSError(
@@ -451,7 +454,7 @@ final class DayflowBackendProvider {
       urlRequest.httpBody = try JSONEncoder().encode(payload)
 
       let requestByteCount = urlRequest.httpBody?.count ?? 0
-      let (data, response) = try await URLSession.shared.data(for: urlRequest)
+      let (data, response) = try await LLMURLSession.data(for: urlRequest)
       responseByteCount = data.count
 
       guard let httpResponse = response as? HTTPURLResponse else {
@@ -573,17 +576,21 @@ final class DayflowBackendProvider {
 
     let sortedScreenshots = screenshots.sorted { $0.capturedAt < $1.capturedAt }
     let sampledScreenshots = Self.evenlySampled(sortedScreenshots, maxCount: Self.maxFramesPerBatch)
+    defer { FrameStore.shared.clearReaders() }
     let screenshotPayloads = sampledScreenshots.compactMap {
       screenshot -> DayflowScreenshotPayload? in
-      guard
-        let data = screenshot.jpegData(
-          maxHeight: Self.timelineFrameMaxHeight, quality: 0.85)
-      else { return nil }
-      return DayflowScreenshotPayload(
-        capturedAt: screenshot.capturedAt,
-        imageBase64: data.base64EncodedString()
-      )
+      autoreleasepool {
+        guard
+          let data = screenshot.jpegData(
+            maxHeight: Self.timelineFrameMaxHeight, quality: 0.65)
+        else { return nil }
+        return DayflowScreenshotPayload(
+          capturedAt: screenshot.capturedAt,
+          imageBase64: data.base64EncodedString()
+        )
+      }
     }
+    FrameStore.shared.clearReaders()
 
     guard !screenshotPayloads.isEmpty else {
       throw NSError(
@@ -645,7 +652,7 @@ final class DayflowBackendProvider {
       urlRequest.httpBody = try JSONEncoder().encode(payload)
 
       let requestByteCount = urlRequest.httpBody?.count ?? 0
-      let (data, response) = try await URLSession.shared.data(for: urlRequest)
+      let (data, response) = try await LLMURLSession.data(for: urlRequest)
       responseByteCount = data.count
 
       guard let httpResponse = response as? HTTPURLResponse else {
@@ -809,7 +816,7 @@ final class DayflowBackendProvider {
       urlRequest.httpBody = try JSONEncoder().encode(payload)
 
       let requestByteCount = urlRequest.httpBody?.count ?? 0
-      let (data, response) = try await URLSession.shared.data(for: urlRequest)
+      let (data, response) = try await LLMURLSession.data(for: urlRequest)
       responseByteCount = data.count
 
       guard let httpResponse = response as? HTTPURLResponse else {
