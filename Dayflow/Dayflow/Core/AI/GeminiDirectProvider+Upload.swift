@@ -4,8 +4,8 @@ extension GeminiDirectProvider {
   func uploadAndAwait(
     _ fileURL: URL, mimeType: String, key: String, maxWaitTime: TimeInterval = 3 * 60
   ) async throws -> (fileSize: Int64, fileURI: String) {
-    let fileData = try Data(contentsOf: fileURL)
-    let fileSize = fileData.count
+    let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+    let fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
 
     // Full cycle retry: upload + processing
     let maxCycles = 3
@@ -22,7 +22,8 @@ extension GeminiDirectProvider {
 
       while uploadAttempt < maxUploadRetries {
         do {
-          uploadedFileURI = try await uploadResumable(data: fileData, mimeType: mimeType)
+          uploadedFileURI = try await uploadResumable(
+            fileURL: fileURL, fileSize: fileSize, mimeType: mimeType)
           break  // Upload success, exit upload retry loop
         } catch {
           uploadAttempt += 1
@@ -130,10 +131,9 @@ extension GeminiDirectProvider {
     var request = URLRequest(url: URL(string: fileEndpoint + "?key=\(apiKey)")!)
     request.httpMethod = "POST"
     request.setValue(mimeType, forHTTPHeaderField: "Content-Type")
-    request.httpBody = data
 
     let requestStart = Date()
-    let (responseData, response) = try await URLSession.shared.data(for: request)
+    let (responseData, response) = try await LLMURLSession.uploadData(data, for: request)
     let requestDuration = Date().timeIntervalSince(requestStart)
     let statusCode = (response as? HTTPURLResponse)?.statusCode
     logCallDuration(operation: "upload.simple", duration: requestDuration, status: statusCode)
@@ -151,31 +151,23 @@ extension GeminiDirectProvider {
       userInfo: [NSLocalizedDescriptionKey: "Failed to parse upload response"])
   }
 
-  func uploadResumable(data: Data, mimeType: String) async throws -> String {
+  func uploadResumable(fileURL: URL, fileSize: Int64, mimeType: String) async throws -> String {
     print("📤 Starting resumable video upload:")
-    print("   Size: \(data.count / 1024 / 1024) MB")
+    print("   Size: \(fileSize / 1024) KB")
     print("   MIME Type: \(mimeType)")
 
     let metadata = GeminiFileMetadata(file: GeminiFileInfo(displayName: "dayflow_video"))
-    let boundary = UUID().uuidString
-
-    var body = Data()
-    body.append("--\(boundary)\r\n".data(using: .utf8)!)
-    body.append("Content-Type: application/json\r\n\r\n".data(using: .utf8)!)
-    body.append(try JSONEncoder().encode(metadata))
-    body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
 
     var request = URLRequest(url: URL(string: fileEndpoint + "?key=\(apiKey)")!)
     request.httpMethod = "POST"
     request.setValue("resumable", forHTTPHeaderField: "X-Goog-Upload-Protocol")
     request.setValue("start", forHTTPHeaderField: "X-Goog-Upload-Command")
-    request.setValue("\(data.count)", forHTTPHeaderField: "X-Goog-Upload-Raw-Size")
+    request.setValue("\(fileSize)", forHTTPHeaderField: "X-Goog-Upload-Raw-Size")
     request.setValue(mimeType, forHTTPHeaderField: "X-Goog-Upload-Header-Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.httpBody = try JSONEncoder().encode(metadata)
 
     let startTime = Date()
-    let (responseData, response) = try await URLSession.shared.data(for: request)
+    let (responseData, response) = try await LLMURLSession.uploadJSON(metadata, for: request)
     let initDuration = Date().timeIntervalSince(startTime)
 
     guard let httpResponse = response as? HTTPURLResponse else {
@@ -204,10 +196,10 @@ extension GeminiDirectProvider {
     uploadRequest.httpMethod = "PUT"
     uploadRequest.setValue("upload, finalize", forHTTPHeaderField: "X-Goog-Upload-Command")
     uploadRequest.setValue("0", forHTTPHeaderField: "X-Goog-Upload-Offset")
-    uploadRequest.httpBody = data
 
     let uploadStartTime = Date()
-    let (uploadResponseData, uploadResponse) = try await URLSession.shared.data(for: uploadRequest)
+    let (uploadResponseData, uploadResponse) = try await LLMURLSession.upload(
+      for: uploadRequest, fromFile: fileURL)
     let uploadDuration = Date().timeIntervalSince(uploadStartTime)
 
     guard let httpUploadResponse = uploadResponse as? HTTPURLResponse else {
@@ -252,8 +244,10 @@ extension GeminiDirectProvider {
         domain: "GeminiError", code: 6, userInfo: [NSLocalizedDescriptionKey: "Invalid file URI"])
     }
 
+    var req = URLRequest(url: url)
+    req.cachePolicy = .reloadIgnoringLocalCacheData
     let requestStart = Date()
-    let (data, response) = try await URLSession.shared.data(from: url)
+    let (data, response) = try await LLMURLSession.data(for: req)
     let requestDuration = Date().timeIntervalSince(requestStart)
     let statusCode = (response as? HTTPURLResponse)?.statusCode
     logCallDuration(operation: "file.status", duration: requestDuration, status: statusCode)

@@ -9,6 +9,7 @@
 
 import AVFoundation
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import VideoToolbox
@@ -20,7 +21,7 @@ final class FrameStore: @unchecked Sendable {
   static let encodeQuality: Float = 0.55
   /// A segment is closed after this much wall-clock time or this many frames
   /// (600 frames is ten minutes at the fastest 1 s capture interval).
-  static let segmentDuration: TimeInterval = 600
+  static let segmentDuration: TimeInterval = 900
   static let maxFramesPerSegment = 600
   /// Every frame is decodable from at most this many frames back. Smaller means
   /// faster random access for thumbnails at a modest file-size cost.
@@ -32,7 +33,8 @@ final class FrameStore: @unchecked Sendable {
   private let readLock = NSLock()
   private var readers: [String: SegmentReader] = [:]
   private var readerOrder: [String] = []
-  private let readerCacheLimit = 4
+  private let readerCacheLimit = 1
+  private var readerEvictWorkItem: DispatchWorkItem?
 
   private init() {}
 
@@ -43,46 +45,112 @@ final class FrameStore: @unchecked Sendable {
     writeQueue.sync { writer?.url.path }
   }
 
+  /// Zero-copy path: encodes a GPU-backed `CMSampleBuffer` directly from its `CVImageBuffer`
+  /// (`IOSurface`) without allocating a `CGImage` or redrawing into a `CGContext`.
+  @discardableResult
+  func append(_ sampleBuffer: CMSampleBuffer, capturedAt: Date, idleSecondsAtCapture: Int?) -> Int64? {
+    writeQueue.sync {
+      autoreleasepool {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+
+        if let current = writer,
+          current.needsRotation(forWidth: width, height: height)
+        {
+          finishWriterLocked()
+        }
+
+        if writer == nil {
+          let url = StorageManager.shared.nextSegmentURL()
+          guard let created = SegmentWriter(url: url, width: width, height: height) else {
+            print("❌ FrameStore: could not start segment at \(url.lastPathComponent)")
+            return nil
+          }
+          writer = created
+        }
+
+        guard let current = writer else { return nil }
+        guard let frameIndex = current.append(pixelBuffer: pixelBuffer) else {
+          if current.hasFailed {
+            print("❌ FrameStore: writer failed, closing segment")
+            finishWriterLocked()
+          }
+          return nil
+        }
+
+        return StorageManager.shared.saveScreenshot(
+          segmentPath: current.url.path,
+          frameIndex: frameIndex,
+          capturedAt: capturedAt,
+          idleSecondsAtCapture: idleSecondsAtCapture
+        )
+      }
+    }
+  }
+
+  /// Fallback path for `CGImage` inputs (e.g., privacy placeholders).
   /// Encodes one frame and records it in the database. Returns the new screenshot id.
   @discardableResult
   func append(_ image: CGImage, capturedAt: Date, idleSecondsAtCapture: Int?) -> Int64? {
     writeQueue.sync {
-      if let current = writer, current.needsRotation(forWidth: image.width, height: image.height) {
-        finishWriterLocked()
-      }
-
-      if writer == nil {
-        let url = StorageManager.shared.nextSegmentURL()
-        guard let created = SegmentWriter(url: url, width: image.width, height: image.height)
-        else {
-          print("❌ FrameStore: could not start segment at \(url.lastPathComponent)")
-          return nil
-        }
-        writer = created
-      }
-
-      guard let current = writer else { return nil }
-      guard let frameIndex = current.append(image) else {
-        // A transient "not ready" just drops this frame; a failed writer closes the segment.
-        if current.hasFailed {
-          print("❌ FrameStore: writer failed, closing segment")
+      autoreleasepool {
+        if let current = writer,
+          current.needsRotation(forWidth: image.width, height: image.height)
+        {
           finishWriterLocked()
         }
-        return nil
-      }
 
-      return StorageManager.shared.saveScreenshot(
-        segmentPath: current.url.path,
-        frameIndex: frameIndex,
-        capturedAt: capturedAt,
-        idleSecondsAtCapture: idleSecondsAtCapture
-      )
+        if writer == nil {
+          let url = StorageManager.shared.nextSegmentURL()
+          guard let created = SegmentWriter(url: url, width: image.width, height: image.height)
+          else {
+            print("❌ FrameStore: could not start segment at \(url.lastPathComponent)")
+            return nil
+          }
+          writer = created
+        }
+
+        guard let current = writer else { return nil }
+        guard let frameIndex = current.append(image) else {
+          // A transient "not ready" just drops this frame; a failed writer closes the segment.
+          if current.hasFailed {
+            print("❌ FrameStore: writer failed, closing segment")
+            finishWriterLocked()
+          }
+          return nil
+        }
+
+        return StorageManager.shared.saveScreenshot(
+          segmentPath: current.url.path,
+          frameIndex: frameIndex,
+          capturedAt: capturedAt,
+          idleSecondsAtCapture: idleSecondsAtCapture
+        )
+      }
     }
   }
 
   /// Finalizes the open segment so it becomes readable. Safe to call when nothing is open.
   func finishCurrentSegment() {
     writeQueue.sync { finishWriterLocked() }
+  }
+
+  /// Releases all cached `SegmentReader` decoders and returns purgeable pixel buffer memory to the OS.
+  func clearReaders() {
+    readLock.lock()
+    readerEvictWorkItem?.cancel()
+    readerEvictWorkItem = nil
+    let activeReaders = Array(readers.values)
+    readers.removeAll()
+    readerOrder.removeAll()
+    readLock.unlock()
+
+    for reader in activeReaders {
+      reader.close()
+    }
+    malloc_zone_pressure_relief(nil, 0)
   }
 
   /// Must be called on `writeQueue`.
@@ -92,6 +160,7 @@ final class FrameStore: @unchecked Sendable {
 
     let succeeded = current.finish()
     let path = current.url.path
+    malloc_zone_pressure_relief(nil, 0)
 
     if succeeded {
       let attributes = try? FileManager.default.attributesOfItem(atPath: path)
@@ -107,24 +176,27 @@ final class FrameStore: @unchecked Sendable {
   /// Drops the most recent segment if a crash left it unreadable. Call once at launch.
   func reconcileAfterLaunch() {
     writeQueue.async {
-      guard let path = StorageManager.shared.mostRecentSegmentPath() else { return }
-      let url = URL(fileURLWithPath: path)
-      guard FileManager.default.fileExists(atPath: path) else {
-        StorageManager.shared.markScreenshotsDeleted(segmentPath: path)
-        return
-      }
-      guard SegmentReader(url: url) != nil else {
-        print(
-          "⚠️ FrameStore: unreadable segment from previous run, dropping \(url.lastPathComponent)")
-        try? FileManager.default.removeItem(at: url)
-        StorageManager.shared.markScreenshotsDeleted(segmentPath: path)
-        return
-      }
-      // Readable, but a crash between finishWriting and the size update leaves NULL sizes.
-      let attributes = try? FileManager.default.attributesOfItem(atPath: path)
-      let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-      if bytes > 0 {
-        StorageManager.shared.updateScreenshotFileSizes(segmentPath: path, totalBytes: bytes)
+      autoreleasepool {
+        guard let path = StorageManager.shared.mostRecentSegmentPath() else { return }
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+          StorageManager.shared.markScreenshotsDeleted(segmentPath: path)
+          return
+        }
+        guard let reader = SegmentReader(url: url) else {
+          print(
+            "⚠️ FrameStore: unreadable segment from previous run, dropping \(url.lastPathComponent)")
+          try? FileManager.default.removeItem(at: url)
+          StorageManager.shared.markScreenshotsDeleted(segmentPath: path)
+          return
+        }
+        reader.close()
+        // Readable, but a crash between finishWriting and the size update leaves NULL sizes.
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        if bytes > 0 {
+          StorageManager.shared.updateScreenshotFileSizes(segmentPath: path, totalBytes: bytes)
+        }
       }
     }
   }
@@ -134,26 +206,38 @@ final class FrameStore: @unchecked Sendable {
   /// Decodes the frame for a screenshot row. Legacy JPEG rows are read directly.
   /// Pass `maxPixelSize` to get a downscaled copy for thumbnails.
   func image(for screenshot: Screenshot, maxPixelSize: Int? = nil) -> CGImage? {
-    guard let frameIndex = screenshot.frameIndex else {
-      return legacyJPEGImage(at: screenshot.fileURL, maxPixelSize: maxPixelSize)
+    autoreleasepool {
+      guard let frameIndex = screenshot.frameIndex else {
+        return legacyJPEGImage(at: screenshot.fileURL, maxPixelSize: maxPixelSize)
+      }
+
+      // A segment that is still being written has no index yet; close it first.
+      if activeSegmentPath == screenshot.filePath {
+        finishCurrentSegment()
+      }
+
+      readLock.lock()
+      defer {
+        scheduleReaderEvictionLocked()
+        readLock.unlock()
+      }
+
+      guard let reader = reader(forPath: screenshot.filePath),
+        let image = reader.cgImage(at: frameIndex, maxPixelSize: maxPixelSize)
+      else { return nil }
+
+      return Self.downscaled(image, maxPixelSize: maxPixelSize)
     }
+  }
 
-    // A segment that is still being written has no index yet; close it first.
-    if activeSegmentPath == screenshot.filePath {
-      finishCurrentSegment()
+  /// Must be called with `readLock` held.
+  private func scheduleReaderEvictionLocked() {
+    readerEvictWorkItem?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      self?.clearReaders()
     }
-
-    readLock.lock()
-    defer { readLock.unlock() }
-
-    guard let reader = reader(forPath: screenshot.filePath),
-      let pixelBuffer = reader.frame(at: frameIndex)
-    else { return nil }
-
-    var decoded: CGImage?
-    VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &decoded)
-    guard let image = decoded else { return nil }
-    return Self.downscaled(image, maxPixelSize: maxPixelSize)
+    readerEvictWorkItem = work
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.5, execute: work)
   }
 
   /// Must be called with `readLock` held.
@@ -169,7 +253,9 @@ final class FrameStore: @unchecked Sendable {
     readerOrder.append(path)
     while readerOrder.count > readerCacheLimit {
       let evicted = readerOrder.removeFirst()
-      readers.removeValue(forKey: evicted)
+      if let old = readers.removeValue(forKey: evicted) {
+        old.close()
+      }
     }
     return created
   }
@@ -216,22 +302,23 @@ private final class SegmentWriter {
   private let startedAt = Date()
   private var frameCount = 0
 
-  private let writer: AVAssetWriter
-  private let input: AVAssetWriterInput
-  private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+  private var writer: AVAssetWriter?
+  private var input: AVAssetWriterInput?
+  private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
   private let colorSpace = CGColorSpaceCreateDeviceRGB()
 
   init?(url: URL, width: Int, height: Int) {
-    // Apple Silicon encoders take a quality target; the Intel encoder only takes a bitrate.
-    let qualityMode: [String: Any] = [AVVideoQualityKey: FrameStore.encodeQuality]
     let bitrateMode: [String: Any] = [
-      AVVideoAverageBitRateKey: Self.fallbackBitRate(width: width, height: height)
+      AVVideoAverageBitRateKey: Self.fallbackBitRate(width: width, height: height),
+      AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
     ]
+    let qualityMode: [String: Any] = [AVVideoQualityKey: FrameStore.encodeQuality]
 
     guard
       let started = Self.startWriter(
-        url: url, width: width, height: height, rateControl: qualityMode)
-        ?? Self.startWriter(url: url, width: width, height: height, rateControl: bitrateMode)
+        url: url, width: width, height: height, codec: .h264, rateControl: bitrateMode)
+        ?? Self.startWriter(
+          url: url, width: width, height: height, codec: .hevc, rateControl: qualityMode)
     else { return nil }
 
     self.url = url
@@ -242,15 +329,15 @@ private final class SegmentWriter {
     self.adaptor = started.adaptor
   }
 
-  var hasFailed: Bool { writer.status == .failed }
+  var hasFailed: Bool { writer?.status == .failed }
 
   private static func fallbackBitRate(width: Int, height: Int) -> Int {
-    // ~2 Mbps at 1080p, scaled by pixel count. At one frame per 10 s this is tiny on disk.
-    max(500_000, Int(2_000_000.0 * Double(width * height) / Double(1920 * 1080)))
+    // ~1.2 Mbps at 720p, scaled by pixel count. At one frame per 10 s this is tiny on disk.
+    max(400_000, Int(1_200_000.0 * Double(width * height) / Double(1280 * 720)))
   }
 
   private static func startWriter(
-    url: URL, width: Int, height: Int, rateControl: [String: Any]
+    url: URL, width: Int, height: Int, codec: AVVideoCodecType, rateControl: [String: Any]
   ) -> (
     writer: AVAssetWriter, input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor
   )? {
@@ -263,7 +350,7 @@ private final class SegmentWriter {
     compression[AVVideoExpectedSourceFrameRateKey] = 1
 
     let settings: [String: Any] = [
-      AVVideoCodecKey: AVVideoCodecType.hevc,
+      AVVideoCodecKey: codec,
       AVVideoWidthKey: width,
       AVVideoHeightKey: height,
       AVVideoCompressionPropertiesKey: compression,
@@ -274,9 +361,10 @@ private final class SegmentWriter {
     let adaptor = AVAssetWriterInputPixelBufferAdaptor(
       assetWriterInput: input,
       sourcePixelBufferAttributes: [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         kCVPixelBufferWidthKey as String: width,
         kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferPoolMinimumBufferCountKey as String: 1,
       ]
     )
 
@@ -296,29 +384,75 @@ private final class SegmentWriter {
       || Date().timeIntervalSince(startedAt) >= FrameStore.segmentDuration
   }
 
-  /// Appends a frame and returns its index within the segment.
-  func append(_ image: CGImage) -> Int? {
-    guard input.isReadyForMoreMediaData, writer.status == .writing else { return nil }
-    guard let pixelBuffer = makePixelBuffer(from: image) else { return nil }
+  /// Zero-copy append directly from a GPU-backed `CVPixelBuffer` (`IOSurface`).
+  func append(pixelBuffer: CVPixelBuffer) -> Int? {
+    autoreleasepool {
+      guard let writer, let input, let adaptor else { return nil }
+      guard input.isReadyForMoreMediaData, writer.status == .writing else { return nil }
 
-    let index = frameCount
-    let time = CMTime(value: CMTimeValue(index), timescale: 1)
-    guard adaptor.append(pixelBuffer, withPresentationTime: time) else { return nil }
-    frameCount += 1
-    return index
+      let index = frameCount
+      let time = CMTime(value: CMTimeValue(index), timescale: 1)
+      let appended = adaptor.append(pixelBuffer, withPresentationTime: time)
+      if let pool = adaptor.pixelBufferPool {
+        CVPixelBufferPoolFlush(pool, .excessBuffers)
+      }
+      guard appended else { return nil }
+      frameCount += 1
+      return index
+    }
+  }
+
+  /// Appends a `CGImage` frame (fallback path) and returns its index within the segment.
+  func append(_ image: CGImage) -> Int? {
+    autoreleasepool {
+      guard let writer, let input, let adaptor else { return nil }
+      guard input.isReadyForMoreMediaData, writer.status == .writing else { return nil }
+      guard let pixelBuffer = makePixelBuffer(from: image, adaptor: adaptor) else { return nil }
+
+      let index = frameCount
+      let time = CMTime(value: CMTimeValue(index), timescale: 1)
+      let appended = adaptor.append(pixelBuffer, withPresentationTime: time)
+      if let pool = adaptor.pixelBufferPool {
+        CVPixelBufferPoolFlush(pool, .excessBuffers)
+      }
+      guard appended else { return nil }
+      frameCount += 1
+      return index
+    }
   }
 
   /// Blocks until the file is finalized. Returns false if the writer failed.
   func finish() -> Bool {
-    guard writer.status == .writing else { return false }
+    guard let writer, let input else { return false }
+    guard writer.status == .writing else {
+      self.adaptor = nil
+      self.input = nil
+      self.writer = nil
+      return false
+    }
+    if let pool = adaptor?.pixelBufferPool {
+      CVPixelBufferPoolFlush(pool, .excessBuffers)
+    }
+    if frameCount > 0 {
+      writer.endSession(atSourceTime: CMTime(value: CMTimeValue(frameCount), timescale: 1))
+    }
     input.markAsFinished()
     let done = DispatchSemaphore(value: 0)
     writer.finishWriting { done.signal() }
     done.wait()
-    return writer.status == .completed && frameCount > 0
+    if let pool = adaptor?.pixelBufferPool {
+      CVPixelBufferPoolFlush(pool, .excessBuffers)
+    }
+    let succeeded = writer.status == .completed && frameCount > 0
+    self.adaptor = nil
+    self.input = nil
+    self.writer = nil
+    return succeeded
   }
 
-  private func makePixelBuffer(from image: CGImage) -> CVPixelBuffer? {
+  private func makePixelBuffer(
+    from image: CGImage, adaptor: AVAssetWriterInputPixelBufferAdaptor
+  ) -> CVPixelBuffer? {
     guard let pool = adaptor.pixelBufferPool else { return nil }
     var pixelBuffer: CVPixelBuffer?
     guard
@@ -338,7 +472,8 @@ private final class SegmentWriter {
         bitsPerComponent: 8,
         bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
         space: colorSpace,
-        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)
+        bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue
+          | CGImageAlphaInfo.premultipliedFirst.rawValue)
     else { return nil }
 
     context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
@@ -353,51 +488,92 @@ private final class SegmentWriter {
 private final class SegmentReader {
   private let asset: AVURLAsset
   private let track: AVAssetTrack
+  private let naturalSize: CGSize
   private var reader: AVAssetReader?
   private var output: AVAssetReaderTrackOutput?
   private var nextIndex = 0
+  private var currentMaxPixelSize: Int?
 
   private static let maxSequentialSkip = 8
 
   init?(url: URL) {
-    let asset = AVURLAsset(url: url)
-    guard let track = Self.loadVideoTrack(from: asset) else { return nil }
+    let asset = AVURLAsset(
+      url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+    guard let (track, size) = Self.loadVideoTrack(from: asset) else { return nil }
     self.asset = asset
     self.track = track
+    self.naturalSize = size
   }
 
-  func frame(at index: Int) -> CVPixelBuffer? {
-    let canContinue =
-      reader?.status == .reading && index >= nextIndex
-      && index - nextIndex <= Self.maxSequentialSkip
-    if !canContinue {
-      guard restart(from: index) else { return nil }
-    }
-
-    guard let output else { return nil }
-    while let sample = output.copyNextSampleBuffer() {
-      let seconds = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-      let sampleIndex = Int(seconds.rounded())
-      nextIndex = sampleIndex + 1
-      if sampleIndex == index {
-        return CMSampleBufferGetImageBuffer(sample)
-      }
-      if sampleIndex > index {
-        return nil
-      }
-    }
-    return nil
+  deinit {
+    close()
   }
 
-  private func restart(from index: Int) -> Bool {
+  func close() {
     reader?.cancelReading()
     reader = nil
     output = nil
+  }
+
+  func cgImage(at index: Int, maxPixelSize: Int?) -> CGImage? {
+    let canContinue =
+      reader?.status == .reading && index >= nextIndex
+      && index - nextIndex <= Self.maxSequentialSkip
+      && currentMaxPixelSize == maxPixelSize
+    if !canContinue {
+      guard restart(from: index, maxPixelSize: maxPixelSize) else { return nil }
+    }
+
+    guard let output else { return nil }
+    var decodedImage: CGImage?
+    var shouldStop = false
+    while !shouldStop {
+      autoreleasepool {
+        guard let sample = output.copyNextSampleBuffer() else {
+          shouldStop = true
+          return
+        }
+        let seconds = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+        let sampleIndex = Int(seconds.rounded())
+        nextIndex = sampleIndex + 1
+        if sampleIndex == index {
+          if let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
+            var cgImg: CGImage?
+            VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &cgImg)
+            decodedImage = cgImg
+          }
+          shouldStop = true
+        } else if sampleIndex > index {
+          shouldStop = true
+        }
+      }
+    }
+    return decodedImage
+  }
+
+  private func restart(from index: Int, maxPixelSize: Int?) -> Bool {
+    close()
 
     guard let newReader = try? AVAssetReader(asset: asset) else { return false }
+    var settings: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+    ]
+    if let maxPixelSize, naturalSize.width > 0, naturalSize.height > 0 {
+      let maxDim = max(naturalSize.width, naturalSize.height)
+      if maxDim > CGFloat(maxPixelSize) {
+        let scale = CGFloat(maxPixelSize) / maxDim
+        var w = max(2, Int((naturalSize.width * scale).rounded()))
+        var h = max(2, Int((naturalSize.height * scale).rounded()))
+        if w % 2 != 0 { w += 1 }
+        if h % 2 != 0 { h += 1 }
+        settings[kCVPixelBufferWidthKey as String] = w
+        settings[kCVPixelBufferHeightKey as String] = h
+      }
+    }
+
     let newOutput = AVAssetReaderTrackOutput(
       track: track,
-      outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+      outputSettings: settings
     )
     newOutput.alwaysCopiesSampleData = false
     guard newReader.canAdd(newOutput) else { return false }
@@ -409,19 +585,27 @@ private final class SegmentReader {
     reader = newReader
     output = newOutput
     nextIndex = index
+    currentMaxPixelSize = maxPixelSize
     return true
   }
 
   /// Blocks until the video track is loaded. Callers are already off the main thread.
-  private static func loadVideoTrack(from asset: AVURLAsset) -> AVAssetTrack? {
-    final class Result: @unchecked Sendable { var track: AVAssetTrack? }
+  private static func loadVideoTrack(from asset: AVURLAsset) -> (AVAssetTrack, CGSize)? {
+    final class Result: @unchecked Sendable {
+      var track: AVAssetTrack?
+      var size: CGSize = .zero
+    }
     let result = Result()
     let done = DispatchSemaphore(value: 0)
     asset.loadTracks(withMediaType: .video) { tracks, _ in
-      result.track = tracks?.first
+      if let first = tracks?.first {
+        result.track = first
+        result.size = first.naturalSize
+      }
       done.signal()
     }
     done.wait()
-    return result.track
+    guard let track = result.track else { return nil }
+    return (track, result.size)
   }
 }

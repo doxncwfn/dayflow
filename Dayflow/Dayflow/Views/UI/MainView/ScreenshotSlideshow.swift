@@ -362,7 +362,7 @@ private let cachedScreenshotScrubberTimeFormatter: DateFormatter = {
   return formatter
 }()
 
-private final class ScreenshotFilmstripGenerator {
+final class ScreenshotFilmstripGenerator {
   static let shared = ScreenshotFilmstripGenerator()
 
   private let queue: OperationQueue = {
@@ -375,9 +375,20 @@ private final class ScreenshotFilmstripGenerator {
 
   private let syncQueue = DispatchQueue(label: "com.dayflow.screenshotfilmstrip.sync")
   private var cache: [String: [NSImage]] = [:]
+  private var cacheOrder: [String] = []
+  private let maxCacheEntries = 3
   private var inflight: [String: [([NSImage]) -> Void]] = [:]
 
   private init() {}
+
+  func clear() {
+    queue.cancelAllOperations()
+    syncQueue.sync {
+      cache.removeAll()
+      cacheOrder.removeAll()
+      inflight.removeAll()
+    }
+  }
 
   func generate(
     screenshots: [Screenshot],
@@ -418,16 +429,24 @@ private final class ScreenshotFilmstripGenerator {
       generated.reserveCapacity(sampled.count)
 
       for index in sampled {
-        let screenshot = screenshots[index]
-        if let image = self.decodeThumbnail(screenshot: screenshot, targetHeight: targetHeight) {
-          generated.append(image)
-        } else {
-          generated.append(self.placeholderImage(width: targetWidth, height: targetHeight))
+        autoreleasepool {
+          let screenshot = screenshots[index]
+          if let image = self.decodeThumbnail(screenshot: screenshot, targetHeight: targetHeight) {
+            generated.append(image)
+          } else {
+            generated.append(self.placeholderImage(width: targetWidth, height: targetHeight))
+          }
         }
       }
 
       self.syncQueue.sync {
         self.cache[key] = generated
+        self.cacheOrder.removeAll { $0 == key }
+        self.cacheOrder.append(key)
+        while self.cacheOrder.count > self.maxCacheEntries {
+          let evicted = self.cacheOrder.removeFirst()
+          self.cache.removeValue(forKey: evicted)
+        }
       }
       self.finish(key: key, images: generated)
     }

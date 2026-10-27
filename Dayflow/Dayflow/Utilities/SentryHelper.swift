@@ -56,17 +56,17 @@ final class SentryHelper {
     SentrySDK.start { options in
       options.dsn = sentryDSN
       options.environment = sentryEnv
-      #if DEBUG
-        options.debug = true
-        options.tracesSampleRate = 1.0
-      #else
-        options.tracesSampleRate = 0.1
-      #endif
-      options.attachStacktrace = true
-      options.enableAppHangTracking = true
-      options.appHangTimeoutInterval = 5.0
-      options.maxBreadcrumbs = 200
-      options.enableAutoSessionTracking = true
+      options.tracesSampleRate = 0.0
+      options.attachStacktrace = false
+      options.enableAppHangTracking = false
+      options.maxBreadcrumbs = 25
+      options.enableAutoSessionTracking = false
+      options.enableSwizzling = false
+      options.enableNetworkTracking = false
+      options.enableNetworkBreadcrumbs = false
+      options.enableFileIOTracing = false
+      options.enableAutoPerformanceTracing = false
+      options.enableCoreDataTracing = false
     }
     isEnabled = true
     uploadAppleCrashReportIfCrashedLastRun()

@@ -186,7 +186,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
   // TEMPORARY DEBUG: Remove after identifying slow queries
   let debugSlowQueries = true
   let slowThresholdMs: Double = 100  // Log anything over 100ms
-  let dbMaxReaderCount = 5
+  let dbMaxReaderCount = 2
 
   // Dedicated queue for database writes to prevent main thread blocking
   let dbWriteQueue = DispatchQueue(label: "com.dayflow.storage.writes", qos: .utility)
@@ -230,6 +230,9 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         try db.execute(sql: "PRAGMA synchronous = NORMAL")
       }
       try db.execute(sql: "PRAGMA busy_timeout = 5000")
+      try db.execute(sql: "PRAGMA cache_size = -2000;")
+      try db.execute(sql: "PRAGMA temp_store = FILE;")
+      try db.execute(sql: "PRAGMA mmap_size = 0;")
     }
 
     // Safe database initialization with automatic recovery from backup
@@ -257,6 +260,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     migrate()
     migrateLegacyChunkPathsIfNeeded()
     truncateOversizedLLMCallBodiesIfNeeded()
+    shrinkMemory()
 
     // Run initial purge, then schedule hourly
     purgeIfNeeded()
@@ -270,17 +274,19 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     startBackupScheduler()
   }
 
+  func shrinkMemory() {
+    try? db?.writeWithoutTransaction { db in
+      try? db.execute(sql: "PRAGMA shrink_memory;")
+    }
+    db?.releaseMemory()
+  }
+
   // TEMPORARY DEBUG: Timing helpers for database operations
   func timedWrite<T>(_ label: String, _ block: (Database) throws -> T) throws -> T {
     let callStart = CFAbsoluteTimeGetCurrent()
     var execStart: CFAbsoluteTime = 0
     var execEnd: CFAbsoluteTime = 0
     let operationID = dbContentionTracker.begin(kind: .write, label: label)
-
-    let writeBreadcrumb = Breadcrumb(level: .debug, category: "database")
-    writeBreadcrumb.message = "DB write: \(label)"
-    writeBreadcrumb.type = "debug"
-    SentryHelper.addBreadcrumb(writeBreadcrumb)
 
     do {
       let result = try db.write { db in
@@ -303,24 +309,26 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
       if debugSlowQueries && (execMs > slowThresholdMs || waitMs > slowThresholdMs) {
         print("⚠️ SLOW WRITE [\(label)]: wait=\(Int(waitMs))ms exec=\(Int(execMs))ms")
 
-        let slowWriteBreadcrumb = Breadcrumb(level: .warning, category: "database")
-        slowWriteBreadcrumb.message = "SLOW DB write: \(label)"
-        slowWriteBreadcrumb.data = [
-          "duration_ms": Int((waitMs + execMs).rounded()),
-          "wait_ms": Int(waitMs.rounded()),
-          "exec_ms": Int(execMs.rounded()),
-          "caller_thread": Thread.isMainThread ? "main" : "background",
-          "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
-          "pool_max_readers": dbMaxReaderCount,
-          "active_reads": contentionSnapshot?.activeReadCount ?? 0,
-          "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
-          "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
-          "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
-          "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
-          "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
-        ]
-        slowWriteBreadcrumb.type = "error"
-        SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+        if SentryHelper.isEnabled {
+          let slowWriteBreadcrumb = Breadcrumb(level: .warning, category: "database")
+          slowWriteBreadcrumb.message = "SLOW DB write: \(label)"
+          slowWriteBreadcrumb.data = [
+            "duration_ms": Int((waitMs + execMs).rounded()),
+            "wait_ms": Int(waitMs.rounded()),
+            "exec_ms": Int(execMs.rounded()),
+            "caller_thread": Thread.isMainThread ? "main" : "background",
+            "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
+            "pool_max_readers": dbMaxReaderCount,
+            "active_reads": contentionSnapshot?.activeReadCount ?? 0,
+            "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
+            "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
+            "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
+            "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
+            "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
+          ]
+          slowWriteBreadcrumb.type = "error"
+          SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+        }
       }
 
       return result
@@ -341,24 +349,26 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         slowThresholdMs: slowThresholdMs
       )
 
-      let slowWriteBreadcrumb = Breadcrumb(level: .error, category: "database")
-      slowWriteBreadcrumb.message = "FAILED DB write: \(label)"
-      slowWriteBreadcrumb.data = [
-        "wait_ms": Int(waitMs.rounded()),
-        "exec_ms": Int(execMs.rounded()),
-        "error": "\(error)",
-        "caller_thread": Thread.isMainThread ? "main" : "background",
-        "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
-        "pool_max_readers": dbMaxReaderCount,
-        "active_reads": contentionSnapshot?.activeReadCount ?? 0,
-        "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
-        "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
-        "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
-        "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
-        "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
-      ]
-      slowWriteBreadcrumb.type = "error"
-      SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+      if SentryHelper.isEnabled {
+        let slowWriteBreadcrumb = Breadcrumb(level: .error, category: "database")
+        slowWriteBreadcrumb.message = "FAILED DB write: \(label)"
+        slowWriteBreadcrumb.data = [
+          "wait_ms": Int(waitMs.rounded()),
+          "exec_ms": Int(execMs.rounded()),
+          "error": "\(error)",
+          "caller_thread": Thread.isMainThread ? "main" : "background",
+          "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
+          "pool_max_readers": dbMaxReaderCount,
+          "active_reads": contentionSnapshot?.activeReadCount ?? 0,
+          "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
+          "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
+          "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
+          "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
+          "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
+        ]
+        slowWriteBreadcrumb.type = "error"
+        SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+      }
       throw error
     }
   }
@@ -368,11 +378,6 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     var execStart: CFAbsoluteTime = 0
     var execEnd: CFAbsoluteTime = 0
     let operationID = dbContentionTracker.begin(kind: .read, label: label)
-
-    let readBreadcrumb = Breadcrumb(level: .debug, category: "database")
-    readBreadcrumb.message = "DB read: \(label)"
-    readBreadcrumb.type = "debug"
-    SentryHelper.addBreadcrumb(readBreadcrumb)
 
     do {
       let result = try db.read { db in
@@ -395,24 +400,26 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
       if debugSlowQueries && (execMs > slowThresholdMs || waitMs > slowThresholdMs) {
         print("⚠️ SLOW READ [\(label)]: wait=\(Int(waitMs))ms exec=\(Int(execMs))ms")
 
-        let slowReadBreadcrumb = Breadcrumb(level: .warning, category: "database")
-        slowReadBreadcrumb.message = "SLOW DB read: \(label)"
-        slowReadBreadcrumb.data = [
-          "duration_ms": Int((waitMs + execMs).rounded()),
-          "wait_ms": Int(waitMs.rounded()),
-          "exec_ms": Int(execMs.rounded()),
-          "caller_thread": Thread.isMainThread ? "main" : "background",
-          "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
-          "pool_max_readers": dbMaxReaderCount,
-          "active_reads": contentionSnapshot?.activeReadCount ?? 0,
-          "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
-          "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
-          "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
-          "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
-          "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
-        ]
-        slowReadBreadcrumb.type = "error"
-        SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+        if SentryHelper.isEnabled {
+          let slowReadBreadcrumb = Breadcrumb(level: .warning, category: "database")
+          slowReadBreadcrumb.message = "SLOW DB read: \(label)"
+          slowReadBreadcrumb.data = [
+            "duration_ms": Int((waitMs + execMs).rounded()),
+            "wait_ms": Int(waitMs.rounded()),
+            "exec_ms": Int(execMs.rounded()),
+            "caller_thread": Thread.isMainThread ? "main" : "background",
+            "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
+            "pool_max_readers": dbMaxReaderCount,
+            "active_reads": contentionSnapshot?.activeReadCount ?? 0,
+            "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
+            "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
+            "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
+            "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
+            "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
+          ]
+          slowReadBreadcrumb.type = "error"
+          SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+        }
       }
 
       return result
@@ -433,24 +440,26 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         slowThresholdMs: slowThresholdMs
       )
 
-      let slowReadBreadcrumb = Breadcrumb(level: .error, category: "database")
-      slowReadBreadcrumb.message = "FAILED DB read: \(label)"
-      slowReadBreadcrumb.data = [
-        "wait_ms": Int(waitMs.rounded()),
-        "exec_ms": Int(execMs.rounded()),
-        "error": "\(error)",
-        "caller_thread": Thread.isMainThread ? "main" : "background",
-        "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
-        "pool_max_readers": dbMaxReaderCount,
-        "active_reads": contentionSnapshot?.activeReadCount ?? 0,
-        "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
-        "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
-        "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
-        "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
-        "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
-      ]
-      slowReadBreadcrumb.type = "error"
-      SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+      if SentryHelper.isEnabled {
+        let slowReadBreadcrumb = Breadcrumb(level: .error, category: "database")
+        slowReadBreadcrumb.message = "FAILED DB read: \(label)"
+        slowReadBreadcrumb.data = [
+          "wait_ms": Int(waitMs.rounded()),
+          "exec_ms": Int(execMs.rounded()),
+          "error": "\(error)",
+          "caller_thread": Thread.isMainThread ? "main" : "background",
+          "caller_qos": DatabaseContentionTracker.qosLabel(Thread.current.qualityOfService),
+          "pool_max_readers": dbMaxReaderCount,
+          "active_reads": contentionSnapshot?.activeReadCount ?? 0,
+          "active_writes": contentionSnapshot?.activeWriteCount ?? 0,
+          "active_read_labels": contentionSnapshot?.activeReadLabels ?? "none",
+          "active_write_labels": contentionSnapshot?.activeWriteLabels ?? "none",
+          "recent_read_labels": contentionSnapshot?.recentReadLabels ?? "none",
+          "recent_write_labels": contentionSnapshot?.recentWriteLabels ?? "none",
+        ]
+        slowReadBreadcrumb.type = "error"
+        SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+      }
       throw error
     }
   }

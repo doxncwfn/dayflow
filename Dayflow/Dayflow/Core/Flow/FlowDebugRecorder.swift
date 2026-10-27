@@ -60,9 +60,15 @@
 
         let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
         let config = SCStreamConfiguration()
-        config.width = display.width
-        config.height = display.height
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        let aspectRatio = Double(display.width) / Double(max(1, display.height))
+        var width = min(1280, Int(720.0 * aspectRatio))
+        var height = min(720, Int(Double(width) / aspectRatio))
+        if width % 2 != 0 { width += 1 }
+        if height % 2 != 0 { height += 1 }
+        config.width = width
+        config.height = height
+        config.queueDepth = 3
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.showsCursor = true
 
         try? FileManager.default.removeItem(at: Self.outputURL)

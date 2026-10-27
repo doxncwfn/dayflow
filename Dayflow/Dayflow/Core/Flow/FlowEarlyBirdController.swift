@@ -41,8 +41,9 @@ final class FlowEarlyBirdController {
     }
   }
 
-  /// Call once at app launch.
+  /// Starts observing once Flow is enabled.
   func start() {
+    guard cancellables.isEmpty else { return }
     AppState.shared.$isRecording
       .map { _ in () }
       .merge(with: FlowSessionMirror.shared.$snapshot.map { _ in () })
@@ -51,13 +52,21 @@ final class FlowEarlyBirdController {
       .sink { [weak self] in self?.evaluate() }
       .store(in: &cancellables)
 
-    // Catches the hour running out and the day rolling over at 4am.
-    let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+    evaluate()
+  }
+
+  private func ensureTimerRunning() {
+    guard timer == nil else { return }
+    let newTimer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
       Task { @MainActor in self?.evaluate() }
     }
-    RunLoop.main.add(timer, forMode: .common)
-    self.timer = timer
-    evaluate()
+    RunLoop.main.add(newTimer, forMode: .common)
+    self.timer = newTimer
+  }
+
+  private func stopTimer() {
+    timer?.invalidate()
+    timer = nil
   }
 
   private func evaluate() {
@@ -91,6 +100,7 @@ final class FlowEarlyBirdController {
   }
 
   private func show(deadline: Date) {
+    ensureTimerRunning()
     let panel = self.panel ?? makePanel()
     self.panel = panel
     if shownDeadline != deadline {
@@ -108,15 +118,26 @@ final class FlowEarlyBirdController {
   }
 
   private func hide() {
-    guard let panel, panel.isVisible else { return }
+    stopTimer()
+    guard let panel, panel.isVisible else {
+      self.panel?.contentView = nil
+      self.panel = nil
+      shownDeadline = nil
+      return
+    }
     NSAnimationContext.runAnimationGroup(
       { context in
         context.duration = 0.2
         panel.animator().alphaValue = 0
       },
-      completionHandler: {
+      completionHandler: { [weak self] in
         Task { @MainActor in
-          if panel.alphaValue == 0 { panel.orderOut(nil) }
+          if panel.alphaValue == 0 {
+            panel.orderOut(nil)
+            self?.panel?.contentView = nil
+            self?.panel = nil
+            self?.shownDeadline = nil
+          }
         }
       })
   }

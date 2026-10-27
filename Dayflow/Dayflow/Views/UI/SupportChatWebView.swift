@@ -98,7 +98,13 @@ enum SupportChatContext: Equatable {
 /// Retains each conversation independently so Flow never shares a support ticket.
 @MainActor
 final class SupportChatSession {
-  static let shared = SupportChatSession(context: .support)
+  private static var _shared: SupportChatSession?
+  static var shared: SupportChatSession {
+    if let existing = _shared { return existing }
+    let created = SupportChatSession(context: .support)
+    _shared = created
+    return created
+  }
   private static var flowWaitlistSessions: [String: SupportChatSession] = [:]
   private static var activeFlowWaitlistSession: SupportChatSession?
   private static var flowAccountObserver: AnyCancellable?
@@ -189,14 +195,55 @@ final class SupportChatSession {
   let context: SupportChatContext
   let websiteDataStore: WKWebsiteDataStore
   lazy var coordinator = SupportChatWebView.Coordinator(session: self, onEvent: { _ in })
-  lazy var webView = SupportChatWebView.makeWebView(session: self)
+  private var _webView: WKWebView?
+  var webView: WKWebView {
+    if let existing = _webView { return existing }
+    let created = SupportChatWebView.makeWebView(session: self)
+    _webView = created
+    return created
+  }
+
+  static func releaseAllWebViews() {
+    _shared?.releaseWebView()
+    _shared = nil
+    activeFlowWaitlistSession?.releaseWebView()
+    activeFlowWaitlistSession = nil
+    flowSupportSession?.releaseWebView()
+    flowSupportSession = nil
+    for session in flowWaitlistSessions.values {
+      session.releaseWebView()
+    }
+    flowWaitlistSessions.removeAll()
+  }
+
+  func releaseWebView() {
+    stop()
+    ready = false
+    failed = false
+    for observer in observers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    observers.removeAll()
+    if let wv = _webView {
+      wv.stopLoading()
+      wv.configuration.userContentController.removeScriptMessageHandler(forName: "support")
+      wv.configuration.userContentController.removeAllUserScripts()
+      wv.navigationDelegate = nil
+      wv.uiDelegate = nil
+      wv.removeFromSuperview()
+    }
+    coordinator.webView = nil
+    _webView = nil
+  }
+
   /// Flow's support overlay and the waitlist screen share one conversation
   /// and page, so each sets its own composer placeholder when it shows.
   func setMessagePlaceholder(_ text: String) {
-    guard let data = try? JSONEncoder().encode(text),
+    guard let wv = _webView,
+      let data = try? JSONEncoder().encode(text),
       let literal = String(data: data, encoding: .utf8)
     else { return }
-    webView.evaluateJavaScript(
+    wv.evaluateJavaScript(
       "var t = document.getElementById('text'); if (t) { t.placeholder = \(literal); }")
   }
 
@@ -296,7 +343,7 @@ final class SupportChatSession {
   private static let reloadInterval: TimeInterval = 60
 
   private var isReading: Bool {
-    let windowVisible = webView.window.map { $0.isVisible && !$0.isMiniaturized } ?? false
+    let windowVisible = _webView?.window.map { $0.isVisible && !$0.isMiniaturized } ?? false
     return chatVisible && NSApp.isActive && windowVisible
   }
 

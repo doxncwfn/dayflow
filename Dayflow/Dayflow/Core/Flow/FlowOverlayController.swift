@@ -20,25 +20,32 @@ final class FlowOverlayController {
   /// What the panel was showing before it hid, so we can pick the matching
   /// exit clip (wave goodbye, climb out of the tub, fly off on the plane).
   private var lastPresentation: FlowOverlayPresentation = .hidden
-  private let backdrop = FlowDemoBackdrop()
+  private var backdrop: FlowDemoBackdrop?
 
   private init() {}
 
-  /// Call once at app launch; keeps the panel in sync with the mirror.
+  /// Starts observing the mirror lazily when needed.
   func start() {
+    guard cancellable == nil else { return }
     cancellable = FlowSessionMirror.shared.$overlay
       .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
+        guard let self else { return }
         // Act on what is showing now, not on the value this delivery carried:
         // a hide followed straight away by a show (the Flow page re-running a
         // step) would otherwise play the exit clip under a bubble that stays.
         let presentation = FlowSessionMirror.shared.overlay
-        self?.backdrop.setShown(presentation.isDemo)
-        if presentation == .hidden {
-          self?.hidePanel()
+        if presentation.isDemo {
+          if self.backdrop == nil { self.backdrop = FlowDemoBackdrop() }
+          self.backdrop?.setShown(true)
         } else {
-          self?.lastPresentation = presentation
-          self?.showPanel()
+          self.backdrop?.setShown(false)
+        }
+        if presentation == .hidden {
+          self.hidePanel()
+        } else {
+          self.lastPresentation = presentation
+          self.showPanel()
         }
       }
   }
@@ -102,8 +109,13 @@ final class FlowOverlayController {
         context.duration = 0.2
         panel.animator().alphaValue = 0
       },
-      completionHandler: {
+      completionHandler: { [weak self] in
         panel.orderOut(nil)
+        Task { @MainActor in
+          guard let self, FlowSessionMirror.shared.overlay == .hidden else { return }
+          self.panel?.contentView = nil
+          self.panel = nil
+        }
       })
   }
 

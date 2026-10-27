@@ -33,10 +33,15 @@ extension Screenshot {
 
   /// Re-encodes the frame as JPEG, scaled down so its height is at most `maxHeight`.
   func jpegData(maxHeight: Int, quality: CGFloat) -> Data? {
-    guard let image = loadCGImage() else { return nil }
-    let maxPixelSize = Self.maxPixelSize(forHeight: maxHeight, image: image)
-    guard let scaled = FrameStore.downscaled(image, maxPixelSize: maxPixelSize) else { return nil }
-    return Self.encodeJPEG(scaled, quality: quality)
+    autoreleasepool {
+      let approxMaxDim = max(maxHeight, Int((Double(maxHeight) * 16.0 / 9.0).rounded()))
+      guard let image = loadCGImage(maxPixelSize: approxMaxDim) else { return nil }
+      let maxPixelSize = Self.maxPixelSize(forHeight: maxHeight, image: image)
+      guard let scaled = FrameStore.downscaled(image, maxPixelSize: maxPixelSize) else {
+        return nil
+      }
+      return Self.encodeJPEG(scaled, quality: quality)
+    }
   }
 
   /// Writes a JPEG copy of the frame to `url`, for tools that need a file path.

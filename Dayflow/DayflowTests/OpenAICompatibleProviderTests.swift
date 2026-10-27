@@ -73,7 +73,7 @@ final class OpenAICompatibleProviderTests: XCTestCase {
     let provider = OpenAICompatibleProvider(configuration: configuration()) { request, _, _ in
       requests += 1
       let prompt = request.messages[1].content[0].text!
-      XCTAssertTrue(prompt.contains("Previous cards:"))
+      XCTAssertTrue(prompt.contains("<previous_cards>"))
       XCTAssertTrue(prompt.contains("Release notes"))
       if requests == 1 { return "[]" }
       XCTAssertTrue(prompt.contains("PREVIOUS ATTEMPT FAILED"))

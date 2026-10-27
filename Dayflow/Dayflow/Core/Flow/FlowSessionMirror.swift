@@ -21,11 +21,30 @@ protocol FlowBridgeForwarding: AnyObject {
 
 @MainActor
 final class FlowSessionMirror: ObservableObject {
-  static let shared = FlowSessionMirror()
+  private static var _shared: FlowSessionMirror?
+  static var isInstantiated: Bool { _shared != nil }
+  static var shared: FlowSessionMirror {
+    if let existing = _shared { return existing }
+    let instance = FlowSessionMirror()
+    _shared = instance
+    StatusBarController.current?.bindFlowSessionIfNeeded()
+    return instance
+  }
+
+  static var hasPersistedActiveSession: Bool {
+    let restored = FlowNativeSnapshot.loadPersisted()
+    guard restored.phase == .active || restored.phase == .onBreak else { return false }
+    let now = Int(Date().timeIntervalSince1970)
+    if let endsAt = restored.sessionEndsAt, endsAt <= now { return false }
+    return true
+  }
 
   @Published private(set) var snapshot: FlowNativeSnapshot
   @Published private(set) var overlay: FlowOverlayPresentation = .hidden {
     didSet {
+      if overlay != .hidden {
+        FlowOverlayController.shared.start()
+      }
       // The variant is fixed per appearance: picked when a nudge brings the
       // creature on screen, kept through the follow-up toast, and reset to
       // the side layout for anything that starts from hidden or needs the

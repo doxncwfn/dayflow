@@ -40,11 +40,9 @@ final class GemmaBackupProvider {
     let sampledScreenshots = Swift.stride(from: 0, to: sortedScreenshots.count, by: strideAmount)
       .map { sortedScreenshots[$0] }
 
-    let frameData = sampledScreenshots.enumerated().compactMap { index, screenshot -> FrameData? in
-      guard let imageData = screenshot.jpegData(maxHeight: 720, quality: 0.7) else { return nil }
-      let base64String = imageData.base64EncodedString()
+    let frameData = sampledScreenshots.enumerated().map { index, screenshot -> FrameData in
       let relativeTimestamp = TimeInterval(screenshot.capturedAt - firstTs)
-      return FrameData(index: index + 1, base64Image: base64String, timestamp: relativeTimestamp)
+      return FrameData(index: index + 1, screenshot: screenshot, timestamp: relativeTimestamp)
     }
 
     guard !frameData.isEmpty else {
@@ -53,6 +51,7 @@ final class GemmaBackupProvider {
         userInfo: [NSLocalizedDescriptionKey: "Failed to load any screenshots for Gemma fallback"])
     }
 
+    defer { FrameStore.shared.clearReaders() }
     let frameDescriptions = try await describeFrames(frameData, batchId: batchId)
 
     let mergedObservations: [Observation]

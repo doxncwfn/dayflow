@@ -21,6 +21,7 @@
 
 import AppKit
 import Combine
+import CoreMedia
 import Foundation
 @preconcurrency import ScreenCaptureKit
 
@@ -1257,9 +1258,8 @@ final class FlowDistractionAgent: ObservableObject {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
-    request.httpBody = try JSONEncoder().encode(payload)
 
-    let (data, response) = try await URLSession.shared.data(for: request)
+    let (data, response) = try await LLMURLSession.uploadJSON(payload, for: request)
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     guard (200...299).contains(status) else {
       let body = String(data: data, encoding: .utf8) ?? ""
@@ -1361,10 +1361,15 @@ final class FlowDistractionAgent: ObservableObject {
 
     let configuration = SCStreamConfiguration()
     let aspectRatio = Double(display.width) / Double(max(1, display.height))
-    configuration.height = height
-    configuration.width = Int(Double(height) * aspectRatio)
+    let clampedHeight = min(height, 720)
+    var clampedWidth = min(1280, Int(Double(clampedHeight) * aspectRatio))
+    if clampedWidth % 2 != 0 { clampedWidth += 1 }
+    configuration.height = clampedHeight
+    configuration.width = clampedWidth
     configuration.scalesToFit = true
     configuration.showsCursor = true
+    configuration.queueDepth = 3
+    configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
     ScreenCaptureMonitor.shared.recordRequest(.screenshot, source: .flow)
     let image = try await SCScreenshotManager.captureImage(
@@ -1372,15 +1377,18 @@ final class FlowDistractionAgent: ObservableObject {
       configuration: configuration
     )
 
-    let bitmap = NSBitmapImageRep(cgImage: image)
-    guard
-      let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
-    else {
-      throw NSError(
-        domain: "FlowAgent", code: -2,
-        userInfo: [NSLocalizedDescriptionKey: "JPEG conversion failed"])
+    try autoreleasepool {
+      let bitmap = NSBitmapImageRep(cgImage: image)
+      guard
+        let jpegData = bitmap.representation(
+          using: .jpeg, properties: [.compressionFactor: quality])
+      else {
+        throw NSError(
+          domain: "FlowAgent", code: -2,
+          userInfo: [NSLocalizedDescriptionKey: "JPEG conversion failed"])
+      }
+      try jpegData.write(to: url, options: .atomic)
     }
-    try jpegData.write(to: url)
     return display
   }
 
